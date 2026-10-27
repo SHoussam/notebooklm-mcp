@@ -26,8 +26,10 @@ import {
 } from "../notebooklm/citations.js";
 import {
   addSource as addSourceToPage,
+  listSources as listSourcesOnPage,
   type AddSourceInput,
   type AddSourceResult,
+  type ListSourcesResult,
 } from "../notebooklm/sources.js";
 import {
   generateAudioOverview as generateAudioOnPage,
@@ -37,6 +39,17 @@ import {
   type AudioGenerationResult,
   type DownloadAudioResult,
 } from "../notebooklm/audio.js";
+import {
+  generateStudioArtifact as generateStudioOnPage,
+  getStudioStatusOnPage,
+  exportStudioArtifact as exportStudioOnPage,
+  type GenerateStudioArtifactOptions,
+  type GenerateStudioArtifactResult,
+  type StudioStatusResult,
+  type ExportStudioArtifactOptions,
+  type ExportStudioArtifactResult,
+} from "../notebooklm/studio.js";
+import { Selectors, joinAlt } from "../notebooklm/selectors.js";
 import { CONFIG } from "../config.js";
 import { log } from "../utils/logger.js";
 import type { SessionInfo, ProgressCallback } from "../types.js";
@@ -174,28 +187,34 @@ export class BrowserSession {
       throw new Error("Page not initialized");
     }
 
+    const combinedQuerySelector = joinAlt(Selectors.chat.queryInput);
+
     try {
-      // PRIMARY: Exact Python selector - textarea.query-box-input
-      log.info("  ⏳ Waiting for chat input (textarea.query-box-input)...");
-      await this.page.waitForSelector("textarea.query-box-input", {
-        timeout: 10000, // Python uses 10s timeout
-        state: "visible", // ONLY check visibility (NO disabled check!)
+      log.info("  ⏳ Waiting for NotebookLM workspace / chat input...");
+      await this.page.waitForSelector(combinedQuerySelector, {
+        timeout: 10000,
+        state: "attached",
       });
       log.success("  ✅ Chat input ready!");
     } catch {
-      // FALLBACK: Python alternative selector
+      // Fresh/empty notebooks auto-open the Add-sources modal over the workspace;
+      // dismiss with Escape or accept that the Add-source button/dialog is mounted.
       try {
-        log.info("  ⏳ Trying fallback selector (aria-label)...");
-        await this.page.waitForSelector('textarea[aria-label="Feld für Anfragen"]', {
-          timeout: 5000, // Python uses 5s for fallback
-          state: "visible",
-        });
-        log.success("  ✅ Chat input ready (fallback)!");
+        await this.page.keyboard.press("Escape").catch(() => undefined);
+        await randomDelay(300, 600);
+        await this.page.waitForSelector(
+          `${combinedQuerySelector}, ${joinAlt(Selectors.sources.addButton)}, ${Selectors.sources.overlayPane}`,
+          {
+            timeout: 8000,
+            state: "visible",
+          }
+        );
+        log.success("  ✅ NotebookLM workspace ready!");
       } catch (error) {
         log.error(`  ❌ NotebookLM interface not ready: ${error}`);
         throw new Error(
-          "Could not find NotebookLM chat input. " +
-            "Please ensure the notebook page has loaded correctly.",
+          "Could not find NotebookLM interface controls. " +
+            "Please ensure the notebook URL is valid and accessible by the signed-in Google account.",
           { cause: error }
         );
       }
@@ -482,15 +501,25 @@ export class BrowserSession {
   }
 
   /**
-   * Add a new source (URL or pasted text) to the active notebook page
-   * (issue #25). Lazily initialises the session so the caller can use this
-   * without first running `ask()`.
+   * Add a new source (`url`, `youtube`, `text`, or `file`) to the active notebook page.
    */
   async addSource(input: AddSourceInput): Promise<AddSourceResult> {
     if (!this.initialized || !this.page || this.isPageClosedSafe()) {
       await this.init();
     }
+    this.updateActivity();
     return await addSourceToPage(this.page!, input);
+  }
+
+  /**
+   * List sources currently loaded in this notebook.
+   */
+  async listSources(): Promise<ListSourcesResult> {
+    if (!this.initialized || !this.page || this.isPageClosedSafe()) {
+      await this.init();
+    }
+    this.updateActivity();
+    return await listSourcesOnPage(this.page!);
   }
 
   /**
@@ -500,6 +529,7 @@ export class BrowserSession {
     if (!this.initialized || !this.page || this.isPageClosedSafe()) {
       await this.init();
     }
+    this.updateActivity();
     return await generateAudioOnPage(this.page!, options);
   }
 
@@ -510,6 +540,7 @@ export class BrowserSession {
     if (!this.initialized || !this.page || this.isPageClosedSafe()) {
       await this.init();
     }
+    this.updateActivity();
     return await getAudioStatusOnPage(this.page!);
   }
 
@@ -520,7 +551,46 @@ export class BrowserSession {
     if (!this.initialized || !this.page || this.isPageClosedSafe()) {
       await this.init();
     }
+    this.updateActivity();
     return await downloadAudioOnPage(this.page!, destinationDir);
+  }
+
+  /**
+   * Trigger any Studio artifact (Audio, Video, Mind Map, Slides, Infographic,
+   * Flashcards, Quiz, Briefing Doc, Study Guide, FAQ, Timeline).
+   */
+  async generateStudioArtifact(
+    options: GenerateStudioArtifactOptions
+  ): Promise<GenerateStudioArtifactResult> {
+    if (!this.initialized || !this.page || this.isPageClosedSafe()) {
+      await this.init();
+    }
+    this.updateActivity();
+    return await generateStudioOnPage(this.page!, options);
+  }
+
+  /**
+   * Inspect all Studio artifacts on the active notebook page.
+   */
+  async getStudioStatus(): Promise<StudioStatusResult> {
+    if (!this.initialized || !this.page || this.isPageClosedSafe()) {
+      await this.init();
+    }
+    this.updateActivity();
+    return await getStudioStatusOnPage(this.page!);
+  }
+
+  /**
+   * Export (download binary or extract Markdown) a completed Studio artifact.
+   */
+  async exportStudioArtifact(
+    options: ExportStudioArtifactOptions
+  ): Promise<ExportStudioArtifactResult> {
+    if (!this.initialized || !this.page || this.isPageClosedSafe()) {
+      await this.init();
+    }
+    this.updateActivity();
+    return await exportStudioOnPage(this.page!, options);
   }
 
   /**
@@ -554,18 +624,7 @@ export class BrowserSession {
       return null;
     }
 
-    const selectors = [
-      // Stable class — language-agnostic.
-      "textarea.query-box-input",
-      // Locale-bound aria-label fallbacks for older builds.
-      'textarea[aria-label="Feld für Anfragen"]',
-      'textarea[aria-label*="anfrag" i]',
-      'textarea[aria-label*="query" i]',
-      'textarea[aria-label*="zone de requete" i]',
-      'textarea[aria-label*="requete" i]',
-      'textarea[aria-label*="consulta" i]',
-      'textarea[aria-label*="domanda" i]',
-    ];
+    const selectors = Selectors.chat.queryInput;
 
     const tryFind = async (): Promise<string | null> => {
       for (const selector of selectors) {

@@ -44,10 +44,15 @@ const PROFILES: Record<ProfileName, string[]> = {
     "select_notebook",
     "get_notebook",
     "setup_auth",
+    "set_auth_cookies",
     "list_sessions",
+    "create_notebook",
+    "discover_notebooks",
     "add_notebook",
     "update_notebook",
     "search_notebooks",
+    "add_source",
+    "list_sources",
   ],
   full: ["*"], // All tools
 };

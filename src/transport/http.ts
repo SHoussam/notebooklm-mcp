@@ -15,9 +15,9 @@
 
 import {
   createServer,
-  IncomingMessage,
+  type IncomingMessage,
   type Server as HttpServer,
-  ServerResponse,
+  type ServerResponse,
 } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
@@ -102,7 +102,14 @@ async function handleRequest(
 
   if (url.pathname === "/healthz" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", protocol: "mcp-streamable-http" }));
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        protocol: "mcp-streamable-http",
+        version: "2.1.0",
+        activeSessions: transports.size,
+      })
+    );
     return;
   }
 

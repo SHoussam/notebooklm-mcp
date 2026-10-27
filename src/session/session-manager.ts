@@ -12,6 +12,7 @@
  * Based on the Python implementation from session_manager.py
  */
 
+import type { BrowserContext } from "patchright";
 import type { AuthManager } from "../auth/auth-manager.js";
 import { BrowserSession } from "./browser-session.js";
 import { SharedContextManager } from "./shared-context-manager.js";
@@ -155,6 +156,19 @@ export class SessionManager {
   }
 
   /**
+   * Access the shared persistent BrowserContext directly for account-level
+   * actions (`create_notebook`, `discover_notebooks`), honouring headless overrides.
+   */
+  async getSharedContext(overrideHeadless?: boolean): Promise<BrowserContext> {
+    if (overrideHeadless !== undefined) {
+      if (this.sharedContextManager.needsHeadlessModeChange(overrideHeadless)) {
+        await this.closeAllSessions();
+      }
+    }
+    return await this.sharedContextManager.getOrCreateContext(overrideHeadless);
+  }
+
+  /**
    * Get an existing session by ID
    */
   getSession(sessionId: string): BrowserSession | null {
@@ -284,10 +298,10 @@ export class SessionManager {
   }
 
   /**
-   * Close all sessions (used during shutdown)
+   * Close all sessions (and optionally stop the background reaper during server shutdown)
    */
-  async closeAllSessions(): Promise<void> {
-    if (this.cleanupInterval) {
+  async closeAllSessions(stopCleanupTimer = false): Promise<void> {
+    if (stopCleanupTimer && this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = undefined;
     }

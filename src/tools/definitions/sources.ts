@@ -1,9 +1,6 @@
 /**
- * MCP tool definitions for source ingestion + Audio Overview (issues #25, #11).
- *
- * The cross-tool async-audio chain (generate → poll → download) is documented
- * in the server-level `instructions` string (see src/index.ts) so individual
- * descriptions stay focused on one operation each.
+ * MCP tool definitions for source ingestion, source listing, Audio Overview,
+ * and unified Studio Artifacts (v2.1.0).
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -13,9 +10,7 @@ const sharedNotebookTargeting = {
     type: "string",
     description:
       "Reuse an existing browser session by id. Recommended when you have " +
-      "already called `ask_question` against the same notebook — saves the " +
-      "10–15 s page-load time. Obtain from `list_sessions` or any prior " +
-      "`ask_question` response (`result.session_id`).",
+      "already interacted with the same notebook — saves page-load time.",
   },
   notebook_id: {
     type: "string",
@@ -26,8 +21,7 @@ const sharedNotebookTargeting = {
   notebook_url: {
     type: "string",
     description:
-      "Direct NotebookLM URL — overrides `notebook_id`. Use for ad-hoc " +
-      "notebooks not yet in your library. Format: " +
+      "Direct NotebookLM URL — overrides `notebook_id`. Format: " +
       "`https://notebooklm.google.com/notebook/<uuid>`.",
   },
 };
@@ -35,42 +29,34 @@ const sharedNotebookTargeting = {
 export const addSourceTool: Tool = {
   name: "add_source",
   description:
-    "Ingest a source into a NotebookLM notebook. Supports two source types " +
-    "in v2.0:\n" +
-    "  • `url` — NotebookLM crawls and indexes a website\n" +
-    "  • `text` — paste raw text (treated as a copied document)\n\n" +
-    "File / YouTube / Google-Drive uploads are not yet implemented.\n\n" +
+    "Ingest a source into a NotebookLM notebook. Supports four source types in v2.1:\n" +
+    "  • `url`     — NotebookLM crawls and indexes a website\n" +
+    "  • `youtube` — NotebookLM indexes a YouTube video's captions/transcript\n" +
+    "  • `text`    — paste raw text (treated as a copied document)\n" +
+    "  • `file`    — upload a local file (.pdf, .txt, .md, .docx, .mp3, .wav, .m4a, images)\n\n" +
     "Returns `sourceCountBefore`/`sourceCountAfter` so the caller can verify " +
-    "the new source landed. Call once per source — multiple sources require " +
-    "multiple calls. NotebookLM finishes indexing within 5–30 seconds; " +
-    "subsequent `ask_question` calls then have the new source in context. " +
-    "Free notebooks cap at 50 sources.\n\n" +
-    "Known quirk: pasted-text uploads occasionally redirect to a freshly " +
-    "created \"Untitled notebook\" on Google's side. The tool detects this " +
-    "and returns a clear error so you can re-try against the correct URL.",
+    "the new source landed. Call once per source.",
   inputSchema: {
     type: "object",
     properties: {
       type: {
         type: "string",
-        enum: ["url", "text"],
+        enum: ["url", "youtube", "text", "file"],
         description:
-          "`url` crawls the supplied website; `text` ingests `content` " +
-          "verbatim as a copied document.",
+          "`url` crawls a website; `youtube` indexes a YouTube video URL; " +
+          "`text` ingests `content` verbatim; `file` uploads a local file path.",
       },
       content: {
         type: "string",
         description:
-          "When `type=url`: a fully-qualified URL (https://…). " +
-          "When `type=text`: the raw text body (any length up to NotebookLM's per-source word limit, ~500 k for free tier).",
+          "When `type=url` or `youtube`: fully-qualified https:// URL. " +
+          "When `type=text`: raw text body. " +
+          "When `type=file`: local path to the file on disk (absolute path recommended).",
       },
       title: {
         type: "string",
         description:
-          "Display title shown in the source list. Optional — NotebookLM " +
-          "picks a sensible default (page title for URLs, first line for text). " +
-          "For text sources, supplying a title is recommended for later " +
-          "identification.",
+          "Optional display title (used when `type=text`; files/URLs use their own titles).",
       },
       show_browser: {
         type: "boolean",
@@ -89,46 +75,51 @@ export const addSourceTool: Tool = {
   },
 };
 
+export const listSourcesTool: Tool = {
+  name: "list_sources",
+  description:
+    "List all sources currently loaded in a NotebookLM notebook's Sources sidebar " +
+    "(count and ordered source titles).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      show_browser: {
+        type: "boolean",
+        description: "Show the browser window for debugging. Default: false.",
+      },
+      ...sharedNotebookTargeting,
+    },
+  },
+  annotations: {
+    title: "List sources in notebook",
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
+};
+
 export const generateAudioTool: Tool = {
   name: "generate_audio",
   description:
-    "Trigger podcast-style Audio Overview generation for a notebook.\n\n" +
-    "**Async by default** — returns immediately with one of:\n" +
-    "  • `status: \"started\"` — generation just kicked off\n" +
-    "  • `status: \"in_progress\"` — a generation was already running; " +
-    "this call attached to it\n" +
-    "  • `status: \"ready\"` (with `alreadyExisted: true`) — an Audio " +
-    "Overview already existed; nothing was triggered\n\n" +
-    "Generation typically takes 2–10 minutes. **Workflow:**\n" +
-    "  1. `generate_audio` → returns immediately\n" +
+    "Trigger podcast-style Audio Overview generation for a notebook (async by default).\n\n" +
+    "Workflow:\n" +
+    "  1. `generate_audio` → returns immediately with `started` / `in_progress` / `ready`\n" +
     "  2. Poll `get_audio_status` every ~30 s\n" +
-    "  3. When status is `ready`, call `download_audio`\n\n" +
-    "Pass `wait_for_completion: true` for legacy synchronous behaviour " +
-    "(blocks for up to `timeout_ms`). Audio Overview is the only Studio " +
-    "output exposed in v2.0 (Video / Mindmap / Quiz / Infographic / " +
-    "Datatable / Presentation are NotebookLM features but not yet wrapped).",
+    "  3. When status is `ready`, call `download_audio`",
   inputSchema: {
     type: "object",
     properties: {
       custom_prompt: {
         type: "string",
-        description:
-          "Optional focus prompt for the Audio Overview, e.g. \"Focus on the " +
-          "API authentication flow and skip pricing\". Passed into the " +
-          "NotebookLM \"Customize\" sub-dialog before generation starts.",
+        description: "Optional focus prompt passed into the Audio Customize dialog.",
       },
       wait_for_completion: {
         type: "boolean",
         description:
-          "If true, block until the audio tile is ready (up to `timeout_ms`). " +
-          "Default false — return immediately and let the caller poll " +
-          "`get_audio_status`.",
+          "If true, block until the audio tile is ready (up to `timeout_ms`). Default: false.",
       },
       timeout_ms: {
         type: "number",
-        description:
-          "Only relevant when `wait_for_completion=true`. Maximum wait for " +
-          "the audio tile to appear. Default 600 000 (10 min).",
+        description: "Maximum wait in ms when `wait_for_completion=true`. Default: 600000.",
       },
       show_browser: {
         type: "boolean",
@@ -141,7 +132,7 @@ export const generateAudioTool: Tool = {
     title: "Generate Audio Overview",
     readOnlyHint: false,
     destructiveHint: false,
-    idempotentHint: true, // Idempotent: existing audio is detected and returned as ready
+    idempotentHint: true,
     openWorldHint: true,
   },
 };
@@ -149,14 +140,7 @@ export const generateAudioTool: Tool = {
 export const getAudioStatusTool: Tool = {
   name: "get_audio_status",
   description:
-    "Non-blocking probe for the current Audio Overview state of a notebook.\n\n" +
-    "Returned `status` values:\n" +
-    "  • `ready` — Audio Overview is generated and ready to download\n" +
-    "  • `in_progress` — generation is currently running\n" +
-    "  • `not_started` — no Audio Overview exists yet for this notebook\n\n" +
-    "Safe to poll every ~30 s while waiting for `generate_audio` to finish. " +
-    "When status flips to `ready`, call `download_audio` with a destination " +
-    "directory.",
+    "Non-blocking probe for the current Audio Overview state (`ready`, `in_progress`, or `not_started`).",
   inputSchema: {
     type: "object",
     properties: {
@@ -177,23 +161,13 @@ export const getAudioStatusTool: Tool = {
 export const downloadAudioTool: Tool = {
   name: "download_audio",
   description:
-    "Save the completed Audio Overview to disk as a `.m4a` file. **Pre-" +
-    "condition:** `get_audio_status` must report `status: \"ready\"`. " +
-    "Calling this before generation completes returns an error message " +
-    "explaining what to do.\n\n" +
-    "The file lands in `destination_dir` with NotebookLM's suggested " +
-    "filename (sanitised — usually the audio's title with underscores). " +
-    "The full saved path is returned in `result.filePath`.",
+    "Save the completed Audio Overview to disk (`destination_dir`). Run after `get_audio_status` reports `ready`.",
   inputSchema: {
     type: "object",
     properties: {
       destination_dir: {
         type: "string",
-        description:
-          "Absolute directory path where the file is saved (created if " +
-          "missing). Example: `/Users/jane/Downloads/notebooklm` or " +
-          "`/tmp/audio`. Relative paths are NOT recommended — the server " +
-          "may run from a different working directory than the caller.",
+        description: "Absolute directory path where the audio file is saved.",
       },
       show_browser: {
         type: "boolean",
@@ -212,9 +186,139 @@ export const downloadAudioTool: Tool = {
   },
 };
 
+export const generateStudioArtifactTool: Tool = {
+  name: "generate_studio_artifact",
+  description:
+    "Trigger generation of any NotebookLM Studio artifact:\n" +
+    "  • `audio`        — Podcast-style Audio Overview\n" +
+    "  • `video`        — Narrated Video Overview\n" +
+    "  • `mindmap`      — Interactive Mind Map\n" +
+    "  • `slide_deck`   — Presentation / Slide Deck\n" +
+    "  • `infographic`  — Visual Infographic\n" +
+    "  • `flashcards`   — Study Flashcards\n" +
+    "  • `quiz`         — Practice Quiz\n" +
+    "  • `briefing_doc` — Briefing Document report\n" +
+    "  • `study_guide`  — Study Guide report\n" +
+    "  • `faq`          — FAQ report\n" +
+    "  • `timeline`     — Chronological Timeline report\n\n" +
+    "Async by default: poll `get_studio_status` and then export via `export_studio_artifact`.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      artifact_type: {
+        type: "string",
+        enum: [
+          "audio",
+          "video",
+          "mindmap",
+          "slide_deck",
+          "infographic",
+          "flashcards",
+          "quiz",
+          "briefing_doc",
+          "study_guide",
+          "faq",
+          "timeline",
+        ],
+        description: "Which Studio artifact to generate.",
+      },
+      custom_prompt: {
+        type: "string",
+        description: "Optional focus prompt when supported by the artifact's customize dialog.",
+      },
+      wait_for_completion: {
+        type: "boolean",
+        description: "Block until the new Studio tile finishes generating. Default: false.",
+      },
+      timeout_ms: {
+        type: "number",
+        description: "Maximum wait in ms when `wait_for_completion=true`. Default: 600000.",
+      },
+      show_browser: {
+        type: "boolean",
+        description: "Show the browser window for debugging. Default: false.",
+      },
+      ...sharedNotebookTargeting,
+    },
+    required: ["artifact_type"],
+  },
+  annotations: {
+    title: "Generate Studio artifact",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+};
+
+export const getStudioStatusTool: Tool = {
+  name: "get_studio_status",
+  description:
+    "Inspect all Studio artifacts in the notebook's right-hand Studio panel " +
+    "(title, 1-based index, icon, and `ready` vs `in_progress` status).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      show_browser: {
+        type: "boolean",
+        description: "Show the browser window for debugging. Default: false.",
+      },
+      ...sharedNotebookTargeting,
+    },
+  },
+  annotations: {
+    title: "Get Studio artifacts status",
+    readOnlyHint: true,
+    openWorldHint: true,
+  },
+};
+
+export const exportStudioArtifactTool: Tool = {
+  name: "export_studio_artifact",
+  description:
+    "Export a completed Studio artifact to `destination_dir`. Downloads binary files " +
+    "(Audio, Video, Infographic, Slides, Mind Map) when a Download option exists, or " +
+    "extracts text/Markdown (`.md`) for Reports, Flashcards, and Quizzes.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      destination_dir: {
+        type: "string",
+        description: "Absolute directory path where the exported artifact file will be saved.",
+      },
+      artifact_index: {
+        type: "number",
+        description:
+          "Optional 1-based artifact index from `get_studio_status` (defaults to the first ready item).",
+      },
+      title_filter: {
+        type: "string",
+        description: "Optional case-insensitive substring to match an artifact's title.",
+      },
+      show_browser: {
+        type: "boolean",
+        description: "Show the browser window for debugging. Default: false.",
+      },
+      ...sharedNotebookTargeting,
+    },
+    required: ["destination_dir"],
+  },
+  annotations: {
+    title: "Export Studio artifact",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+};
+
 export const sourceTools: Tool[] = [
   addSourceTool,
+  listSourcesTool,
   generateAudioTool,
   getAudioStatusTool,
   downloadAudioTool,
+  generateStudioArtifactTool,
+  getStudioStatusTool,
+  exportStudioArtifactTool,
 ];

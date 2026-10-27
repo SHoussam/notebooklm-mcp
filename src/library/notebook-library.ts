@@ -116,11 +116,12 @@ export class NotebookLibrary {
    * Generate a unique ID from a string (slug format)
    */
   private generateId(name: string): string {
-    const base = name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .substring(0, 30);
+    const base =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .substring(0, 30) || "notebook";
 
     // Ensure uniqueness
     let id = base;

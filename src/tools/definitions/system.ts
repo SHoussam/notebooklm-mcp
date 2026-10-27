@@ -113,6 +113,35 @@ export const systemTools: Tool[] = [
     },
   },
   {
+    name: "set_auth_cookies",
+    description:
+      "Import Google authentication cookies or session tokens directly without opening a browser.\n\n" +
+      "Accepts:\n" +
+      "  • Raw `Cookie:` header copied from DevTools Network tab on https://notebooklm.google.com\n" +
+      "  • JSON cookie array from extensions like Cookie-Editor or EditThisCookie\n" +
+      "  • Key-value map of Google tokens (SID, HSID, SSID, OSID, __Secure-1PSID, __Secure-3PSID)\n\n" +
+      "Use this when headful browser login is unavailable, blocked by OS window isolation, or when you want to supply " +
+      "pre-authenticated session cookies directly from your regular browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cookies: {
+          type: "string",
+          description:
+            "Raw 'Cookie:' header string from https://notebooklm.google.com, exported JSON cookie array, or Google auth tokens",
+        },
+      },
+      required: ["cookies"],
+    },
+    annotations: {
+      title: "Set authentication cookies",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: "cleanup_data",
     description:
       "Two-phase deep cleanup of all server data on disk (auth state, " +

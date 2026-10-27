@@ -22,6 +22,7 @@ import {
   isChannelFailure,
   withChannel,
 } from "../browser/chromium-fallback.js";
+import { ensureBrowserWindowVisible } from "../browser/windows-foreground.js";
 import fs from "fs";
 import path from "path";
 
@@ -160,8 +161,8 @@ export class SharedContextManager {
     const baseLaunchOptions = {
       headless: shouldBeHeadless,
       viewport: CONFIG.viewport,
-      locale: "en-US",
-      timezoneId: "Europe/Berlin",
+      locale: CONFIG.locale,
+      timezoneId: CONFIG.timezoneId,
       // ✅ CRITICAL FIX: Pass storageState directly at launch!
       // This is the PROPER way to handle session cookies (Playwright bug workaround)
       // Benefits:
@@ -174,6 +175,7 @@ export class SharedContextManager {
         "--disable-dev-shm-usage",
         "--no-first-run",
         "--no-default-browser-check",
+        ...(!shouldBeHeadless ? ["--start-maximized", "--window-position=80,50"] : []),
       ],
     };
 
@@ -273,6 +275,12 @@ export class SharedContextManager {
     }
 
     log.success("✅ Persistent context ready!");
+    if (!shouldBeHeadless && this.currentProfileDir) {
+      const firstPage = this.globalContext.pages()[0];
+      if (firstPage) {
+        await ensureBrowserWindowVisible(firstPage, this.currentProfileDir);
+      }
+    }
     log.dim(`  Context ID: ${this.getContextId()}`);
     log.dim(`  Chrome Profile: ${CONFIG.chromeProfileDir}`);
     log.success("  🎯 Fingerprint: PERSISTENT (same across restarts!)");

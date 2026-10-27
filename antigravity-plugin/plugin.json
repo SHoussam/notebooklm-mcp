@@ -1,0 +1,28 @@
+{
+  "name": "notebooklm-plugin",
+  "displayName": "Google NotebookLM MCP",
+  "version": "2.1.0",
+  "description": "Session-based research, PDF/YouTube/URL/text source ingestion, citation-grounded Q&A, remote notebook creation/discovery, and full Studio artifact generation (Audio, Video, Mind Map, Slide Deck, Infographic, Flashcards, Quiz, Reports) via Google NotebookLM.",
+  "logo": "https://www.gstatic.com/images/branding/productlogos/notebooklm/v1/web-96dp/logo_notebooklm_color_2x_web_96dp.png",
+  "suggestedPrompts": [
+    "Check NotebookLM health and authenticate if needed",
+    "Create a new NotebookLM notebook, upload my project PDFs, and summarize key architectural trade-offs with footnotes",
+    "Generate a Mind Map and Audio Overview from my active NotebookLM notebook"
+  ],
+  "author": {
+    "name": "SHoussam"
+  },
+  "homepage": "https://github.com/SHoussam/notebooklm-mcp#readme",
+  "repository": "https://github.com/SHoussam/notebooklm-mcp",
+  "license": "MIT",
+  "keywords": [
+    "notebooklm",
+    "mcp",
+    "gemini",
+    "research",
+    "rag",
+    "citations",
+    "studio",
+    "audio-overview"
+  ]
+}

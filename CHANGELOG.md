@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-10-27
+
+Revived & upgraded release in `SHoussam/notebooklm-mcp` adding full NotebookLM
+Studio artifacts, local file/PDF & YouTube uploads, remote notebook creation &
+discovery, Antigravity plugin packaging, and critical Windows + multi-session
+HTTP fixes.
+
+### Added
+
+- **Zero-GUI session cookie & token authentication**:
+  - `set_auth_cookies` — imports Google authentication cookies or session tokens directly
+    without needing a browser window. Accepts raw `Cookie:` header strings from DevTools Network
+    tab, Cookie-Editor JSON arrays, or key-value token maps (`SID`, `HSID`, `SSID`, `OSID`,
+    `__Secure-1PSID`, `__Secure-3PSID`).
+  - `npm run auth:cookies "<string>"` / `npm run auth:token` CLI entrypoints.
+  - Replaced hardcoded 24-hour file age invalidation with real cookie expiration date verification.
+- **Remote notebook creation & discovery**:
+  - `create_notebook` — creates a brand-new notebook on `notebooklm.google.com`,
+    sets its title, and automatically registers + activates it in the local library.
+  - `discover_notebooks` — scans the signed-in Google account's NotebookLM home
+    dashboard and returns existing notebooks' titles, UUIDs, and URLs.
+- **Expanded source ingestion & inspection**:
+  - `add_source` widened to `type: "url" | "youtube" | "text" | "file"` — supports
+    uploading local `.pdf`, `.md`, `.txt`, `.docx`, audio, and image files via
+    `<input type="file">` / native `filechooser` fallback with pre-flight path validation,
+    plus dedicated YouTube transcript indexing.
+  - `list_sources` — enumerates all sources currently loaded in a notebook's
+    Sources sidebar (`count` + ordered `sources[]`).
+- **Unified Studio Artifacts engine (`src/notebooklm/studio.ts`)**:
+  - `generate_studio_artifact` — triggers any of the 11 NotebookLM Studio outputs:
+    `audio`, `video`, `mindmap`, `slide_deck`, `infographic`, `flashcards`,
+    `quiz`, `briefing_doc`, `study_guide`, `faq`, and `timeline` (supports both
+    direct Studio chips and nested Reports dialogs, plus `custom_prompt`).
+  - `get_studio_status` — lists all tiles in the Studio panel with 1-based index,
+    title, icon, and `ready` vs `in_progress` status across 8 UI locales.
+  - `export_studio_artifact` — downloads binary media (Audio, Video, Slides,
+    Infographic, Mind Map) or extracts Markdown (`.md`) for Reports, Flashcards,
+    and Quizzes into `destination_dir`.
+- **Google Antigravity Plugin bundle (`antigravity-plugin/`)**:
+  - Ready-to-install `plugin.json`, `mcp_config.json`, and `skills/notebooklm/SKILL.md`.
+- **Automated test suite (`tests/server-and-config.test.ts`)**:
+  - Covers `AsyncLocalStorage` concurrent config isolation, multi-session
+    Streamable-HTTP clients, 26-tool profile filtering, selector ordering, and
+    file upload pre-validation.
+
+### Fixed
+
+- **Windows `npm install` / `npm run build` crash**: replaced Unix-only
+  `chmod +x dist/index.js` in `postbuild` with cross-platform Node `fs.chmodSync`.
+- **Streamable-HTTP multi-session crash**: `NotebookLMMCPServer` now instantiates
+  a dedicated MCP protocol `Server` per transport session (`createProtocolServer()`),
+  fixing `Already connected to a transport` when a second HTTP client connects.
+- **Concurrent `CONFIG` mutation race**: replaced `Object.assign(CONFIG, ...)`
+  in tool handlers with `AsyncLocalStorage`-backed `runWithConfig(...)`, and wired
+  `browser_options.timeout_ms` to update `answerTimeoutMs` as well as `browserTimeout`.
+- **Windows Chrome profile `EBUSY` locks during `setup_auth` & `cleanup_data`**:
+  active sessions and shared persistent contexts are now closed before touching
+  `chrome_profile` on disk, without killing the background idle-session reaper timer.
+- **2026 NotebookLM DOM selectors**: fixed `sourceTypeUrl` ordering so URL sources
+  no longer click `youtube-icon` first, wired `Selectors.chat.queryInput` into
+  `BrowserSession` with empty-notebook modal Escape recovery, and replaced the
+  hardcoded `Europe/Berlin` browser timezone with dynamic system timezone detection.
+
 ## [2.0.0] - 2026-04-30
 
 Major release that closes the issue backlog and replaces the brittle parts of
@@ -93,6 +156,7 @@ supported.
 ## [1.2.0] - 2025-11-21
 
 ### Added
+
 - **Tool Profiles System** - Reduce token usage by loading only the tools you need
   - Three profiles: `minimal` (5 tools), `standard` (10 tools), `full` (16 tools)
   - Persistent configuration via `~/.config/notebooklm-mcp/settings.json`
@@ -105,12 +169,14 @@ supported.
   - `npx notebooklm-mcp config reset` - Reset to defaults
 
 ### Changed
+
 - **Modularized Codebase** - Improved maintainability and code organization
   - Split monolithic `src/tools/index.ts` into `definitions.ts` and `handlers.ts`
   - Extracted resource handling into dedicated `ResourceHandlers` class
   - Cleaner separation of concerns throughout the codebase
 
 ### Fixed
+
 - **LibreChat Compatibility** - Fixed "Server does not support completions" error
   - Added `prompts: {}` and `logging: {}` to server capabilities
   - Resolves GitHub Issue #3 for LibreChat integration
@@ -124,6 +190,7 @@ supported.
 ## [1.1.2] - 2025-10-19
 
 ### Changed
+
 - **README Documentation** - Added Claude Code Skill reference
   - New badge linking to [notebooklm-skill](https://github.com/PleasePrompto/notebooklm-skill) repository
   - Added prominent callout section explaining Claude Code Skill availability
@@ -134,12 +201,14 @@ supported.
 ## [1.1.1] - 2025-10-18
 
 ### Fixed
+
 - **Binary executable permissions** - Fixed "Permission denied" error when running via npx
   - Added `postbuild` script that automatically runs `chmod +x dist/index.js`
   - Ensures binary has executable permissions after compilation
   - Fixes installation issue where users couldn't run the MCP server
 
 ### Repository
+
 - **Added package-lock.json** - Committed lockfile to repository for reproducible builds
   - Ensures consistent dependency versions across all environments
   - Improves contributor experience with identical development setup
@@ -149,6 +218,7 @@ supported.
 ## [1.1.0] - 2025-10-18
 
 ### Added
+
 - **Deep Cleanup Tool** - Comprehensive system cleanup for fresh NotebookLM MCP installations
   - Scans entire system for ALL NotebookLM files (installation data, caches, logs, temp files)
   - Finds hidden files in NPM cache, Claude CLI logs, editor logs, system trash, temp backups
@@ -161,6 +231,7 @@ supported.
 - Changelog badge and link in README.md
 
 ### Changed
+
 - **Configuration System Simplified** - No config files needed anymore!
   - `config.json` completely removed - works out of the box with sensible defaults
   - Settings passed as tool parameters (`browser_options`) or environment variables
@@ -186,6 +257,7 @@ supported.
 - README.md updated to reflect config-less architecture
 
 ### Fixed
+
 - **Critical: envPaths() default suffix bug** - `env-paths` library appends `-nodejs` suffix by default
   - All paths were incorrectly created with `-nodejs` suffix
   - Fix: Explicitly pass `{suffix: ""}` to disable default behavior
@@ -220,6 +292,7 @@ supported.
   - **Files changed**: `src/tools/index.ts`, `src/session/shared-context-manager.ts`
 
 ### Removed
+
 - Empty postinstall scripts (cleaner codebase)
   - Deleted: `src/postinstall.ts`, `dist/postinstall.js`, type definitions
   - Removed: `postinstall` npm script from package.json
@@ -228,36 +301,42 @@ supported.
 ## [1.0.5] - 2025-10-17
 
 ### Changed
+
 - Documentation improvements
 - Updated README installation instructions
 
 ## [1.0.4] - 2025-10-17
 
 ### Changed
+
 - Enhanced usage examples in documentation
 - Fixed formatting in usage guide
 
 ## [1.0.3] - 2025-10-16
 
 ### Changed
+
 - Improved troubleshooting guide
 - Added common issues and solutions
 
 ## [1.0.2] - 2025-10-16
 
 ### Fixed
+
 - Fixed typos in documentation
 - Clarified authentication flow
 
 ## [1.0.1] - 2025-10-16
 
 ### Changed
+
 - Enhanced README with better examples
 - Added more detailed setup instructions
 
 ## [1.0.0] - 2025-10-16
 
 ### Added
+
 - Initial release
 - NotebookLM integration via Model Context Protocol (MCP)
 - Session-based conversations with Gemini 2.5

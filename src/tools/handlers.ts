@@ -1,7 +1,10 @@
 /**
- * MCP Tool Handlers
+ * MCP Tool Handlers (v2.1.0)
  *
- * Implements the logic for all MCP tools.
+ * Implements the logic for all 26 MCP tools with request-scoped `runWithConfig`
+ * isolation (`AsyncLocalStorage`), Windows profile-lock safety during auth/cleanup,
+ * remote notebook creation & discovery, local file & YouTube uploads, source
+ * listing, and unified Studio artifacts.
  */
 
 import type { SessionManager } from "../session/session-manager.js";
@@ -13,9 +16,21 @@ import type {
   NotebookEntry,
   UpdateNotebookInput,
 } from "../library/types.js";
-import type { AddSourceResult } from "../notebooklm/sources.js";
+import type { AddSourceResult, ListSourcesResult, SourceType } from "../notebooklm/sources.js";
 import type { AudioGenerationResult, DownloadAudioResult } from "../notebooklm/audio.js";
-import { CONFIG, applyBrowserOptions, type BrowserOptions } from "../config.js";
+import {
+  createRemoteNotebook,
+  discoverRemoteNotebooks,
+  type CreateNotebookResult,
+  type DiscoverNotebooksResult,
+} from "../notebooklm/notebooks.js";
+import type {
+  ExportStudioArtifactResult,
+  GenerateStudioArtifactResult,
+  StudioArtifactType,
+  StudioStatusResult,
+} from "../notebooklm/studio.js";
+import { CONFIG, applyBrowserOptions, runWithConfig, type BrowserOptions } from "../config.js";
 import { log } from "../utils/logger.js";
 import type { AskQuestionResult, ToolResult, ProgressCallback } from "../types.js";
 import { RateLimitError } from "../errors.js";
@@ -36,6 +51,19 @@ function followUpReminderEnabled(): boolean {
   if (raw === undefined) return false;
   const lower = raw.trim().toLowerCase();
   return lower === "true" || lower === "1" || lower === "yes";
+}
+
+/**
+ * Compute `overrideHeadless` parameter (`true` = show browser window) for SessionManager.
+ */
+function computeShowBrowserOverride(
+  showBrowser?: boolean,
+  browserOptions?: BrowserOptions
+): boolean | undefined {
+  if (showBrowser !== undefined) return showBrowser;
+  if (browserOptions?.show !== undefined) return browserOptions.show;
+  if (browserOptions?.headless !== undefined) return !browserOptions.headless;
+  return undefined;
 }
 
 /**
@@ -90,7 +118,6 @@ export class ToolHandlers {
     }
 
     try {
-      // Resolve notebook URL
       let resolvedNotebookUrl = notebook_url;
 
       if (!resolvedNotebookUrl && notebook_id) {
@@ -113,37 +140,20 @@ export class ToolHandlers {
         }
       }
 
-      // Progress: Getting or creating session
       await sendProgress?.("Getting or creating browser session...", 1, 5);
 
-      // Apply browser options temporarily
-      const originalConfig = { ...CONFIG };
-      const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
-      Object.assign(CONFIG, effectiveConfig);
+      const scopedConfig = applyBrowserOptions(browser_options, show_browser);
+      const overrideHeadless = computeShowBrowserOverride(show_browser, browser_options);
 
-      // Calculate overrideHeadless parameter for session manager
-      // show_browser takes precedence over browser_options.headless
-      let overrideHeadless: boolean | undefined = undefined;
-      if (show_browser !== undefined) {
-        overrideHeadless = show_browser;
-      } else if (browser_options?.show !== undefined) {
-        overrideHeadless = browser_options.show;
-      } else if (browser_options?.headless !== undefined) {
-        overrideHeadless = !browser_options.headless;
-      }
-
-      try {
-        // Get or create session (with headless override to handle mode changes)
+      return await runWithConfig(scopedConfig, async () => {
         const session = await this.sessionManager.getOrCreateSession(
           session_id,
           resolvedNotebookUrl,
           overrideHeadless
         );
 
-        // Progress: Asking question
         await sendProgress?.("Asking question to NotebookLM...", 2, 5);
 
-        // Ask the question (pass progress callback)
         const rawAnswer = await session.ask(question, sendProgress);
 
         // Extract citations from the same page session before any other call
@@ -157,7 +167,6 @@ export class ToolHandlers {
           : trimmed;
         const answer = applyAiMarker(withReminder);
 
-        // Get session info
         const sessionInfo = session.getInfo();
 
         const result: AskQuestionResult = {
@@ -176,7 +185,6 @@ export class ToolHandlers {
           ...(citationResult.citations.length > 0 && { sources: citationResult.citations }),
         };
 
-        // Progress: Complete
         await sendProgress?.("Question answered successfully!", 5, 5);
 
         log.success(`✅ [TOOL] ask_question completed successfully`);
@@ -184,14 +192,10 @@ export class ToolHandlers {
           success: true,
           data: result,
         };
-      } finally {
-        // Restore original CONFIG
-        Object.assign(CONFIG, originalConfig);
-      }
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      // Special handling for rate limit errors
       if (error instanceof RateLimitError || errorMessage.toLowerCase().includes("rate limit")) {
         log.error(`🚫 [TOOL] Rate limit detected`);
         return {
@@ -381,15 +385,9 @@ export class ToolHandlers {
     log.info(`🔧 [TOOL] get_health called`);
 
     try {
-      // Check authentication status
       const statePath = await this.authManager.getValidStatePath();
       const authenticated = statePath !== null;
-
-      // Get session stats
       const stats = this.sessionManager.getStats();
-
-      // Resolve current notebook from the library — `CONFIG.notebookUrl` is a
-      // legacy field (v1) that's no longer set in v2's library-driven flow.
       const active = this.library.getActiveNotebook();
       const notebookUrl = active?.url || CONFIG.notebookUrl || "not configured";
 
@@ -407,7 +405,6 @@ export class ToolHandlers {
         headless: CONFIG.headless,
         auto_login_enabled: CONFIG.autoLoginEnabled,
         stealth_enabled: CONFIG.stealthEnabled,
-        // Add troubleshooting tip if not authenticated
         ...(!authenticated && {
           troubleshooting_tip:
             "For fresh start with clean browser session: Close all Chrome instances → " +
@@ -433,8 +430,8 @@ export class ToolHandlers {
   /**
    * Handle setup_auth tool
    *
-   * Opens a browser window for manual login with live progress updates.
-   * The operation waits synchronously for login completion (up to 10 minutes).
+   * Closes any open persistent sessions first (avoiding Windows Chrome profile
+   * file locks), then opens a visible browser window for manual Google login.
    */
   async handleSetupAuth(
     args: {
@@ -452,7 +449,6 @@ export class ToolHandlers {
   > {
     const { show_browser, browser_options } = args;
 
-    // CRITICAL: Send immediate progress to reset timeout from the very start
     await sendProgress?.("Initializing authentication setup...", 0, 10);
 
     log.info(`🔧 [TOOL] setup_auth called`);
@@ -461,70 +457,53 @@ export class ToolHandlers {
     }
 
     const startTime = Date.now();
+    const scopedConfig = applyBrowserOptions(browser_options, show_browser);
+    const overrideHeadless = computeShowBrowserOverride(show_browser, browser_options);
 
-    // Apply browser options temporarily
-    const originalConfig = { ...CONFIG };
-    const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
-    Object.assign(CONFIG, effectiveConfig);
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        await sendProgress?.("Closing any active browser sessions...", 1, 10);
+        await this.sessionManager.closeAllSessions();
 
-    try {
-      // Progress: Starting
-      await sendProgress?.("Preparing authentication browser...", 1, 10);
+        log.info(`  🌐 Opening browser for interactive login...`);
+        await sendProgress?.("Opening browser window...", 2, 10);
 
-      log.info(`  🌐 Opening browser for interactive login...`);
+        const success = await this.authManager.performSetup(sendProgress, overrideHeadless);
+        const durationSeconds = (Date.now() - startTime) / 1000;
 
-      // Progress: Opening browser
-      await sendProgress?.("Opening browser window...", 2, 10);
-
-      // Perform setup with progress updates (uses CONFIG internally)
-      const success = await this.authManager.performSetup(sendProgress);
-
-      const durationSeconds = (Date.now() - startTime) / 1000;
-
-      if (success) {
-        // Progress: Complete
-        await sendProgress?.("Authentication saved successfully!", 10, 10);
-
-        log.success(`✅ [TOOL] setup_auth completed (${durationSeconds.toFixed(1)}s)`);
-        return {
-          success: true,
-          data: {
-            status: "authenticated",
-            message: "Successfully authenticated and saved browser state",
-            authenticated: true,
-            duration_seconds: durationSeconds,
-          },
-        };
-      } else {
-        log.error(`❌ [TOOL] setup_auth failed (${durationSeconds.toFixed(1)}s)`);
+        if (success) {
+          await sendProgress?.("Authentication saved successfully!", 10, 10);
+          log.success(`✅ [TOOL] setup_auth completed (${durationSeconds.toFixed(1)}s)`);
+          return {
+            success: true,
+            data: {
+              status: "authenticated",
+              message: "Successfully authenticated and saved browser state",
+              authenticated: true,
+              duration_seconds: durationSeconds,
+            },
+          };
+        } else {
+          log.error(`❌ [TOOL] setup_auth failed (${durationSeconds.toFixed(1)}s)`);
+          return {
+            success: false,
+            error: "Authentication failed or was cancelled",
+          };
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const durationSeconds = (Date.now() - startTime) / 1000;
+        log.error(`❌ [TOOL] setup_auth failed: ${errorMessage} (${durationSeconds.toFixed(1)}s)`);
         return {
           success: false,
-          error: "Authentication failed or was cancelled",
+          error: errorMessage,
         };
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      log.error(`❌ [TOOL] setup_auth failed: ${errorMessage} (${durationSeconds.toFixed(1)}s)`);
-      return {
-        success: false,
-        error: errorMessage,
-      };
-    } finally {
-      // Restore original CONFIG
-      Object.assign(CONFIG, originalConfig);
-    }
+    });
   }
 
   /**
    * Handle re_auth tool
-   *
-   * Performs a complete re-authentication:
-   * 1. Closes all active browser sessions
-   * 2. Deletes all saved authentication data (cookies, Chrome profile)
-   * 3. Opens browser for fresh Google login
-   *
-   * Use for switching Google accounts or recovering from rate limits.
    */
   async handleReAuth(
     args: {
@@ -549,64 +528,197 @@ export class ToolHandlers {
     }
 
     const startTime = Date.now();
+    const scopedConfig = applyBrowserOptions(browser_options, show_browser);
+    const overrideHeadless = computeShowBrowserOverride(show_browser, browser_options);
 
-    // Apply browser options temporarily
-    const originalConfig = { ...CONFIG };
-    const effectiveConfig = applyBrowserOptions(browser_options, show_browser);
-    Object.assign(CONFIG, effectiveConfig);
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        await sendProgress?.("Closing all active sessions...", 1, 12);
+        log.info("  🛑 Closing all sessions...");
+        await this.sessionManager.closeAllSessions();
+        log.success("  ✅ All sessions closed");
 
-    try {
-      // 1. Close all active sessions
-      await sendProgress?.("Closing all active sessions...", 1, 12);
-      log.info("  🛑 Closing all sessions...");
-      await this.sessionManager.closeAllSessions();
-      log.success("  ✅ All sessions closed");
+        await sendProgress?.("Clearing authentication data...", 2, 12);
+        log.info("  🗑️  Clearing all auth data...");
+        await this.authManager.clearAllAuthData();
+        log.success("  ✅ Auth data cleared");
 
-      // 2. Clear all auth data
-      await sendProgress?.("Clearing authentication data...", 2, 12);
-      log.info("  🗑️  Clearing all auth data...");
-      await this.authManager.clearAllAuthData();
-      log.success("  ✅ Auth data cleared");
+        await sendProgress?.("Starting fresh authentication...", 3, 12);
+        log.info("  🌐 Starting fresh authentication setup...");
+        const success = await this.authManager.performSetup(sendProgress, overrideHeadless);
 
-      // 3. Perform fresh setup
-      await sendProgress?.("Starting fresh authentication...", 3, 12);
-      log.info("  🌐 Starting fresh authentication setup...");
-      const success = await this.authManager.performSetup(sendProgress);
+        const durationSeconds = (Date.now() - startTime) / 1000;
 
-      const durationSeconds = (Date.now() - startTime) / 1000;
+        if (success) {
+          await sendProgress?.("Re-authentication complete!", 12, 12);
+          log.success(`✅ [TOOL] re_auth completed (${durationSeconds.toFixed(1)}s)`);
+          return {
+            success: true,
+            data: {
+              status: "authenticated",
+              message:
+                "Successfully re-authenticated with new account. All previous sessions have been closed.",
+              authenticated: true,
+              duration_seconds: durationSeconds,
+            },
+          };
+        } else {
+          log.error(`❌ [TOOL] re_auth failed (${durationSeconds.toFixed(1)}s)`);
+          return {
+            success: false,
+            error: "Re-authentication failed or was cancelled",
+          };
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const durationSeconds = (Date.now() - startTime) / 1000;
+        log.error(`❌ [TOOL] re_auth failed: ${errorMessage} (${durationSeconds.toFixed(1)}s)`);
+        return {
+          success: false,
+          error: errorMessage,
+        };
+      }
+    });
+  }
 
-      if (success) {
-        await sendProgress?.("Re-authentication complete!", 12, 12);
-        log.success(`✅ [TOOL] re_auth completed (${durationSeconds.toFixed(1)}s)`);
+  /**
+   * Handle set_auth_cookies tool (v2.1.0)
+   * Import Google cookies or session tokens directly without opening a browser.
+   */
+  async handleSetAuthCookies(args: {
+    cookies?: string;
+    raw_cookie_header?: string;
+    token?: string;
+  }): Promise<
+    ToolResult<{
+      status: string;
+      message: string;
+      authenticated: boolean;
+      imported_count: number;
+      critical_cookies_found: string[];
+    }>
+  > {
+    const rawInput = args.cookies || args.raw_cookie_header || args.token || "";
+    if (!rawInput) {
+      return {
+        success: false,
+        error:
+          "Missing required 'cookies' argument. Provide a raw Cookie header string, exported JSON cookie array, or tokens.",
+      };
+    }
+
+    log.info(`🔑 [TOOL] set_auth_cookies called`);
+    const res = await this.authManager.importCookies(rawInput);
+    if (!res.success) {
+      log.error(`❌ [TOOL] set_auth_cookies failed: ${res.error || res.message}`);
+      return {
+        success: false,
+        error: res.error || res.message,
+      };
+    }
+
+    log.success(`✅ [TOOL] set_auth_cookies successfully imported ${res.importedCount} cookies`);
+    return {
+      success: true,
+      data: {
+        status: "authenticated",
+        message: res.message,
+        authenticated: true,
+        imported_count: res.importedCount,
+        critical_cookies_found: res.criticalFound,
+      },
+    };
+  }
+
+  /**
+   * Handle create_notebook tool (v2.1.0)
+   *
+   * Creates a new notebook on `https://notebooklm.google.com/` and optionally
+   * adds + selects it in the local library.
+   */
+  async handleCreateNotebook(args: {
+    title: string;
+    description?: string;
+    topics?: string[];
+    add_to_library?: boolean;
+    show_browser?: boolean;
+  }): Promise<
+    ToolResult<{
+      created: CreateNotebookResult;
+      notebook?: NotebookEntry;
+    }>
+  > {
+    log.info(`🔧 [TOOL] create_notebook called (title="${args.title}")`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const context = await this.sessionManager.getSharedContext(overrideHeadless);
+        const created = await createRemoteNotebook(context, { title: args.title });
+        if (!created.success || !created.url) {
+          return {
+            success: false,
+            error: created.message || "Failed to create remote NotebookLM notebook",
+            data: { created },
+          };
+        }
+
+        let libraryEntry: NotebookEntry | undefined;
+        if (args.add_to_library !== false) {
+          libraryEntry = this.library.addNotebook({
+            url: created.url,
+            name: args.title,
+            description:
+              args.description?.trim() || `Notebook created via NotebookLM MCP (${args.title})`,
+            topics: args.topics && args.topics.length > 0 ? args.topics : ["general"],
+          });
+          this.library.selectNotebook(libraryEntry.id);
+        }
+
         return {
           success: true,
           data: {
-            status: "authenticated",
-            message:
-              "Successfully re-authenticated with new account. All previous sessions have been closed.",
-            authenticated: true,
-            duration_seconds: durationSeconds,
+            created,
+            ...(libraryEntry && { notebook: libraryEntry }),
           },
         };
-      } else {
-        log.error(`❌ [TOOL] re_auth failed (${durationSeconds.toFixed(1)}s)`);
-        return {
-          success: false,
-          error: "Re-authentication failed or was cancelled",
-        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] create_notebook failed: ${msg}`);
+        return { success: false, error: msg };
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const durationSeconds = (Date.now() - startTime) / 1000;
-      log.error(`❌ [TOOL] re_auth failed: ${errorMessage} (${durationSeconds.toFixed(1)}s)`);
-      return {
-        success: false,
-        error: errorMessage,
-      };
-    } finally {
-      // Restore original CONFIG
-      Object.assign(CONFIG, originalConfig);
-    }
+    });
+  }
+
+  /**
+   * Handle discover_notebooks tool (v2.1.0)
+   */
+  async handleDiscoverNotebooks(args: {
+    show_browser?: boolean;
+  }): Promise<ToolResult<DiscoverNotebooksResult>> {
+    log.info(`🔧 [TOOL] discover_notebooks called`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const context = await this.sessionManager.getSharedContext(overrideHeadless);
+        const result = await discoverRemoteNotebooks(context);
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.message || "Failed to discover remote notebooks",
+            data: result,
+          };
+        }
+        return { success: true, data: result };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] discover_notebooks failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
   }
 
   /**
@@ -837,8 +949,6 @@ export class ToolHandlers {
 
   /**
    * Handle cleanup_data tool
-   *
-   * ULTRATHINK Deep Cleanup - scans entire system for ALL NotebookLM MCP files
    */
   async handleCleanupData(args: { confirm: boolean; preserve_library?: boolean }): Promise<
     ToolResult<{
@@ -872,11 +982,9 @@ export class ToolHandlers {
     const cleanupManager = new CleanupManager();
 
     try {
-      // Always run in deep mode
       const mode = "deep";
 
       if (!confirm) {
-        // Preview mode - show what would be deleted
         log.info(`  📋 Generating cleanup preview (mode: ${mode})...`);
 
         const preview = await cleanupManager.getCleanupPaths(mode, preserve_library);
@@ -900,8 +1008,8 @@ export class ToolHandlers {
           },
         };
       } else {
-        // Cleanup mode - actually delete files
-        log.info(`  🗑️  Performing cleanup (mode: ${mode})...`);
+        log.info(`  🗑️  Closing sessions and performing cleanup (mode: ${mode})...`);
+        await this.sessionManager.closeAllSessions();
 
         const result = await cleanupManager.performCleanup(mode, preserve_library);
 
@@ -938,8 +1046,8 @@ export class ToolHandlers {
   }
 
   /**
-   * Resolve a notebook URL the same way `handleAskQuestion` does. Used by the
-   * new source/audio tools so we don't duplicate the lookup logic.
+   * Resolve a notebook URL the same way `handleAskQuestion` does. Used by
+   * source, audio, and Studio tools so we don't duplicate lookup logic.
    */
   private async resolveNotebookUrl(
     notebookId?: string,
@@ -956,10 +1064,10 @@ export class ToolHandlers {
   }
 
   /**
-   * Handle add_source tool (issue #25).
+   * Handle add_source tool (`url`, `youtube`, `text`, or `file`).
    */
   async handleAddSource(args: {
-    type: "url" | "text";
+    type: SourceType;
     content: string;
     title?: string;
     session_id?: string;
@@ -968,32 +1076,67 @@ export class ToolHandlers {
     show_browser?: boolean;
   }): Promise<ToolResult<{ result: AddSourceResult }>> {
     log.info(`🔧 [TOOL] add_source called (type=${args.type})`);
-    const originalConfig = { ...CONFIG };
-    if (args.show_browser !== undefined) {
-      const effectiveConfig = applyBrowserOptions(undefined, args.show_browser);
-      Object.assign(CONFIG, effectiveConfig);
-    }
-    const overrideHeadless = args.show_browser === undefined ? undefined : args.show_browser;
-    try {
-      const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
-      const session = await this.sessionManager.getOrCreateSession(
-        args.session_id,
-        url,
-        overrideHeadless
-      );
-      const result = await session.addSource({
-        type: args.type,
-        content: args.content,
-        title: args.title,
-      });
-      return { success: result.success, data: { result } };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.error(`❌ [TOOL] add_source failed: ${msg}`);
-      return { success: false, error: msg };
-    } finally {
-      Object.assign(CONFIG, originalConfig);
-    }
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.addSource({
+          type: args.type,
+          content: args.content,
+          title: args.title,
+        });
+        return {
+          success: result.success,
+          ...(result.success ? {} : { error: result.message }),
+          data: { result },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] add_source failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
+  }
+
+  /**
+   * Handle list_sources tool (v2.1.0).
+   */
+  async handleListSources(args: {
+    session_id?: string;
+    notebook_id?: string;
+    notebook_url?: string;
+    show_browser?: boolean;
+  }): Promise<ToolResult<ListSourcesResult>> {
+    log.info(`🔧 [TOOL] list_sources called`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.listSources();
+        return {
+          success: true,
+          data: result,
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] list_sources failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
   }
 
   /**
@@ -1009,37 +1152,37 @@ export class ToolHandlers {
     show_browser?: boolean;
   }): Promise<ToolResult<{ result: AudioGenerationResult }>> {
     log.info(`🔧 [TOOL] generate_audio called`);
-    const originalConfig = { ...CONFIG };
-    if (args.show_browser !== undefined) {
-      Object.assign(CONFIG, applyBrowserOptions(undefined, args.show_browser));
-    }
-    const overrideHeadless = args.show_browser === undefined ? undefined : args.show_browser;
-    try {
-      const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
-      const session = await this.sessionManager.getOrCreateSession(
-        args.session_id,
-        url,
-        overrideHeadless
-      );
-      const result = await session.generateAudio({
-        customPrompt: args.custom_prompt,
-        timeoutMs: args.timeout_ms,
-        waitForCompletion: args.wait_for_completion ?? false,
-      });
-      // `started` and `in_progress` count as success — the generation is on
-      // its way; the caller polls `get_audio_status` for completion.
-      const ok =
-        result.status === "ready" ||
-        result.status === "started" ||
-        result.status === "in_progress";
-      return { success: ok, data: { result } };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.error(`❌ [TOOL] generate_audio failed: ${msg}`);
-      return { success: false, error: msg };
-    } finally {
-      Object.assign(CONFIG, originalConfig);
-    }
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.generateAudio({
+          customPrompt: args.custom_prompt,
+          timeoutMs: args.timeout_ms,
+          waitForCompletion: args.wait_for_completion ?? false,
+        });
+        const ok =
+          result.status === "ready" ||
+          result.status === "started" ||
+          result.status === "in_progress";
+        return {
+          success: ok,
+          ...(ok ? {} : { error: result.message }),
+          data: { result },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] generate_audio failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
   }
 
   /**
@@ -1052,27 +1195,25 @@ export class ToolHandlers {
     show_browser?: boolean;
   }): Promise<ToolResult<{ result: AudioGenerationResult }>> {
     log.info(`🔧 [TOOL] get_audio_status called`);
-    const originalConfig = { ...CONFIG };
-    if (args.show_browser !== undefined) {
-      Object.assign(CONFIG, applyBrowserOptions(undefined, args.show_browser));
-    }
-    const overrideHeadless = args.show_browser === undefined ? undefined : args.show_browser;
-    try {
-      const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
-      const session = await this.sessionManager.getOrCreateSession(
-        args.session_id,
-        url,
-        overrideHeadless
-      );
-      const result = await session.getAudioStatus();
-      return { success: true, data: { result } };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.error(`❌ [TOOL] get_audio_status failed: ${msg}`);
-      return { success: false, error: msg };
-    } finally {
-      Object.assign(CONFIG, originalConfig);
-    }
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.getAudioStatus();
+        return { success: true, data: { result } };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] get_audio_status failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
   }
 
   /**
@@ -1086,27 +1227,155 @@ export class ToolHandlers {
     show_browser?: boolean;
   }): Promise<ToolResult<{ result: DownloadAudioResult }>> {
     log.info(`🔧 [TOOL] download_audio called`);
-    const originalConfig = { ...CONFIG };
-    if (args.show_browser !== undefined) {
-      Object.assign(CONFIG, applyBrowserOptions(undefined, args.show_browser));
-    }
-    const overrideHeadless = args.show_browser === undefined ? undefined : args.show_browser;
-    try {
-      const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
-      const session = await this.sessionManager.getOrCreateSession(
-        args.session_id,
-        url,
-        overrideHeadless
-      );
-      const result = await session.downloadAudio(args.destination_dir);
-      return { success: result.success, data: { result } };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      log.error(`❌ [TOOL] download_audio failed: ${msg}`);
-      return { success: false, error: msg };
-    } finally {
-      Object.assign(CONFIG, originalConfig);
-    }
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.downloadAudio(args.destination_dir);
+        return {
+          success: result.success,
+          ...(result.success ? {} : { error: result.message }),
+          data: { result },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] download_audio failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
+  }
+
+  /**
+   * Handle generate_studio_artifact tool (v2.1.0).
+   */
+  async handleGenerateStudioArtifact(args: {
+    artifact_type: StudioArtifactType;
+    custom_prompt?: string;
+    wait_for_completion?: boolean;
+    timeout_ms?: number;
+    session_id?: string;
+    notebook_id?: string;
+    notebook_url?: string;
+    show_browser?: boolean;
+  }): Promise<ToolResult<{ result: GenerateStudioArtifactResult }>> {
+    log.info(`🔧 [TOOL] generate_studio_artifact called (type=${args.artifact_type})`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.generateStudioArtifact({
+          artifactType: args.artifact_type,
+          customPrompt: args.custom_prompt,
+          waitForCompletion: args.wait_for_completion ?? false,
+          timeoutMs: args.timeout_ms,
+        });
+        const ok =
+          result.status === "ready" ||
+          result.status === "started" ||
+          result.status === "in_progress";
+        return {
+          success: ok,
+          ...(ok ? {} : { error: result.message }),
+          data: { result },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] generate_studio_artifact failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
+  }
+
+  /**
+   * Handle get_studio_status tool (v2.1.0).
+   */
+  async handleGetStudioStatus(args: {
+    session_id?: string;
+    notebook_id?: string;
+    notebook_url?: string;
+    show_browser?: boolean;
+  }): Promise<ToolResult<StudioStatusResult>> {
+    log.info(`🔧 [TOOL] get_studio_status called`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.getStudioStatus();
+        const ok = result.status === "ok";
+        return {
+          success: ok,
+          ...(ok ? {} : { error: result.message }),
+          data: result,
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] get_studio_status failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
+  }
+
+  /**
+   * Handle export_studio_artifact tool (v2.1.0).
+   */
+  async handleExportStudioArtifact(args: {
+    destination_dir: string;
+    artifact_index?: number;
+    title_filter?: string;
+    session_id?: string;
+    notebook_id?: string;
+    notebook_url?: string;
+    show_browser?: boolean;
+  }): Promise<ToolResult<{ result: ExportStudioArtifactResult }>> {
+    log.info(`🔧 [TOOL] export_studio_artifact called`);
+    const scopedConfig = applyBrowserOptions(undefined, args.show_browser);
+    const overrideHeadless = computeShowBrowserOverride(args.show_browser);
+
+    return await runWithConfig(scopedConfig, async () => {
+      try {
+        const url = await this.resolveNotebookUrl(args.notebook_id, args.notebook_url);
+        const session = await this.sessionManager.getOrCreateSession(
+          args.session_id,
+          url,
+          overrideHeadless
+        );
+        const result = await session.exportStudioArtifact({
+          destinationDir: args.destination_dir,
+          artifactIndex: args.artifact_index,
+          titleFilter: args.title_filter,
+        });
+        return {
+          success: result.success,
+          ...(result.success ? {} : { error: result.message }),
+          data: { result },
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        log.error(`❌ [TOOL] export_studio_artifact failed: ${msg}`);
+        return { success: false, error: msg };
+      }
+    });
   }
 
   /**
@@ -1114,7 +1383,7 @@ export class ToolHandlers {
    */
   async cleanup(): Promise<void> {
     log.info(`🧹 Cleaning up tool handlers...`);
-    await this.sessionManager.closeAllSessions();
+    await this.sessionManager.closeAllSessions(true);
     log.success(`✅ Tool handlers cleanup complete`);
   }
 }

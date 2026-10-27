@@ -8,6 +8,70 @@ import type { Tool } from "@modelcontextprotocol/sdk/types.js";
  */
 export const notebookManagementTools: Tool[] = [
   {
+    name: "create_notebook",
+    description:
+      "Create a brand-new NotebookLM notebook on `https://notebooklm.google.com/` " +
+      "and optionally register + activate it in your local library in one step.\n\n" +
+      "Requires an authenticated Google session (`setup_auth`). After creation, " +
+      "call `add_source` (`url`, `youtube`, `text`, or `file`) to populate it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Title for the new NotebookLM notebook.",
+        },
+        description: {
+          type: "string",
+          description: "Optional 1–2 sentence summary used when `add_to_library=true`.",
+        },
+        topics: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional topics list used when `add_to_library=true`.",
+        },
+        add_to_library: {
+          type: "boolean",
+          description:
+            "Automatically register the new notebook in the local library and set it active. Default: true.",
+        },
+        show_browser: {
+          type: "boolean",
+          description: "Show the browser window for debugging. Default: false.",
+        },
+      },
+      required: ["title"],
+    },
+    annotations: {
+      title: "Create new NotebookLM notebook",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  {
+    name: "discover_notebooks",
+    description:
+      "Scan `https://notebooklm.google.com/` for existing notebooks on the " +
+      "signed-in Google account, returning their titles, UUIDs, and URLs so " +
+      "they can be registered in the local library without manual copy-pasting.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        show_browser: {
+          type: "boolean",
+          description: "Show the browser window for debugging. Default: false.",
+        },
+      },
+    },
+    annotations: {
+      title: "Discover remote NotebookLM notebooks",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
+  },
+  {
     name: "add_notebook",
     description:
       "Register a NotebookLM notebook in the local library so it can be " +
@@ -126,9 +190,9 @@ export const notebookManagementTools: Tool[] = [
       "caller omits `notebook_id` / `notebook_url`.\n\n" +
       "When to call:\n" +
       "  • The user explicitly switches context (e.g. \"Let's work on " +
-      "React now\")\n" +
+      'React now")\n' +
       "  • Task obviously needs a different notebook than the current one — " +
-      "announce the switch (\"Switching to the React notebook…\") before " +
+      'announce the switch ("Switching to the React notebook…") before ' +
       "calling.\n" +
       "  • If the right notebook is ambiguous, ask the user first instead " +
       "of guessing.",
@@ -235,8 +299,8 @@ export const notebookManagementTools: Tool[] = [
       "Search the library by free-text query — matches against `name`, " +
       "`description`, `topics`, and `tags`. Returns notebook objects with " +
       "their `id` so you can chain into `select_notebook` etc.\n\n" +
-      "Use this when the user references a notebook by topic (\"the React " +
-      "one\") instead of by exact name. If multiple notebooks match, " +
+      'Use this when the user references a notebook by topic ("the React ' +
+      'one") instead of by exact name. If multiple notebooks match, ' +
       "propose the top 1–2 and let the user choose.",
     inputSchema: {
       type: "object",
@@ -260,7 +324,7 @@ export const notebookManagementTools: Tool[] = [
       "Aggregate statistics about the local notebook library: " +
       "`total_notebooks`, `active_notebook` (id), `most_used_notebook`, " +
       "`total_queries`, `last_modified`. Useful as a quick health check or " +
-      "when the user asks \"what notebooks do I have?\".",
+      'when the user asks "what notebooks do I have?".',
     inputSchema: {
       type: "object",
       properties: {},

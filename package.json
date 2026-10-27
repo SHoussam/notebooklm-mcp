@@ -1,22 +1,25 @@
 {
   "name": "notebooklm-mcp",
-  "version": "2.0.0",
-  "description": "MCP server for Google NotebookLM — chat, source ingestion, audio overviews, citations, stdio + Streamable-HTTP transports.",
+  "version": "2.1.0",
+  "description": "MCP server for Google NotebookLM — chat, PDF/YouTube/URL/text source ingestion, notebook creation, Studio artifacts (Audio, Video, Mind Map, Slides, Reports, Flashcards/Quiz), citations, stdio + multi-session Streamable-HTTP transports.",
   "type": "module",
   "bin": {
     "notebooklm-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "chmod +x dist/index.js",
+    "postbuild": "node -e \"import('node:fs').then(fs => fs.chmodSync('dist/index.js', 0o755))\"",
     "watch": "tsc --watch",
     "dev": "tsx watch src/index.ts",
     "prepare": "npm run build",
-    "test": "tsx src/index.ts",
-    "lint": "eslint src",
-    "lint:fix": "eslint src --fix",
-    "format": "prettier --write src",
-    "format:check": "prettier --check src",
+    "auth": "node dist/index.js auth",
+    "auth:cookies": "node dist/index.js auth:cookies",
+    "auth:token": "node dist/index.js auth:token",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix",
+    "format": "prettier --write src tests",
+    "format:check": "prettier --check src tests",
     "check": "npm run format:check && npm run lint && npm run build"
   },
   "keywords": [
@@ -24,24 +27,25 @@
     "notebooklm",
     "gemini",
     "ai",
+    "antigravity",
     "claude"
   ],
-  "author": "Gérôme Dexheimer <hello@geromedexheimer.de> (https://github.com/PleasePrompto)",
+  "author": "SHoussam (fork of PleasePrompto/notebooklm-mcp)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PleasePrompto/notebooklm-mcp.git"
+    "url": "git+https://github.com/SHoussam/notebooklm-mcp.git"
   },
-  "homepage": "https://github.com/PleasePrompto/notebooklm-mcp#readme",
+  "homepage": "https://github.com/SHoussam/notebooklm-mcp#readme",
   "bugs": {
-    "url": "https://github.com/PleasePrompto/notebooklm-mcp/issues"
+    "url": "https://github.com/SHoussam/notebooklm-mcp/issues"
   },
   "files": [
     "dist",
     "README.md",
-    "NOTEBOOKLM_USAGE.md",
     "LICENSE",
-    "docs"
+    "docs",
+    "antigravity-plugin"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

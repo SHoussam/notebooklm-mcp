@@ -2,13 +2,12 @@
  * Configuration for NotebookLM MCP Server
  *
  * Config Priority (highest to lowest):
- * 1. Hardcoded Defaults (works out of the box!)
+ * 1. Per-Request Tool Parameters (isolated via AsyncLocalStorage — concurrency-safe)
  * 2. Environment Variables (optional, for advanced users)
- * 3. Tool Parameters (passed by Claude at runtime)
- *
- * No config.json file needed - all settings via ENV or tool parameters!
+ * 3. Hardcoded Defaults (works out of the box!)
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import envPaths from "env-paths";
 import fs from "fs";
 import path from "path";
@@ -27,6 +26,8 @@ const paths = envPaths("notebooklm-mcp", { suffix: "" });
 export const NOTEBOOKLM_AUTH_URL =
   "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fnotebooklm.google.com%2F&flowName=GlifWebSignIn&flowEntry=ServiceLogin";
 
+export const NOTEBOOKLM_HOME_URL = "https://notebooklm.google.com/";
+
 export interface Config {
   // NotebookLM - optional, used for legacy default notebook
   notebookUrl: string;
@@ -42,6 +43,8 @@ export interface Config {
    */
   answerTimeoutMs: number;
   viewport: { width: number; height: number };
+  locale: string;
+  timezoneId: string;
 
   // Session Management
   maxSessions: number;
@@ -85,6 +88,14 @@ export interface Config {
   instanceProfileMaxCount: number;
 }
 
+function detectSystemTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
 /**
  * Default Configuration (works out of the box!)
  */
@@ -101,6 +112,8 @@ const DEFAULTS: Config = {
   // selectors that rely on `isVisible()` falsely report "not started".
   // Use a desktop-class viewport so the three-pane layout always renders.
   viewport: { width: 1920, height: 1080 },
+  locale: "en-US",
+  timezoneId: detectSystemTimezone(),
 
   // Session Management
   maxSessions: 10,
@@ -144,9 +157,6 @@ const DEFAULTS: Config = {
   instanceProfileMaxCount: 20,
 };
 
-/**
- * Parse boolean from string (for env vars)
- */
 function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined) return defaultValue;
   const lower = value.toLowerCase();
@@ -155,18 +165,12 @@ function parseBoolean(value: string | undefined, defaultValue: boolean): boolean
   return defaultValue;
 }
 
-/**
- * Parse integer from string (for env vars)
- */
 function parseInteger(value: string | undefined, defaultValue: number): number {
   if (value === undefined) return defaultValue;
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? defaultValue : parsed;
 }
 
-/**
- * Parse comma-separated array (for env vars)
- */
 function parseArray(value: string | undefined, defaultValue: string[]): string[] {
   if (!value) return defaultValue;
   return value
@@ -175,10 +179,6 @@ function parseArray(value: string | undefined, defaultValue: string[]): string[]
     .filter((s) => s.length > 0);
 }
 
-/**
- * Parse the multi-instance profile strategy from env, falling back to the
- * default when the value is missing or unrecognised.
- */
 function parseProfileStrategy(
   value: string | undefined,
   fallback: Config["profileStrategy"]
@@ -187,17 +187,15 @@ function parseProfileStrategy(
   return fallback;
 }
 
-/**
- * Apply environment variable overrides (legacy support)
- */
 function applyEnvOverrides(config: Config): Config {
   return {
     ...config,
-    // Override with env vars if present
     notebookUrl: process.env.NOTEBOOK_URL || config.notebookUrl,
     headless: parseBoolean(process.env.HEADLESS, config.headless),
     browserTimeout: parseInteger(process.env.BROWSER_TIMEOUT, config.browserTimeout),
     answerTimeoutMs: parseInteger(process.env.ANSWER_TIMEOUT_MS, config.answerTimeoutMs),
+    locale: process.env.BROWSER_LOCALE || config.locale,
+    timezoneId: process.env.BROWSER_TIMEZONE || config.timezoneId,
     maxSessions: parseInteger(process.env.MAX_SESSIONS, config.maxSessions),
     sessionTimeout: parseInteger(process.env.SESSION_TIMEOUT, config.sessionTimeout),
     autoLoginEnabled: parseBoolean(process.env.AUTO_LOGIN_ENABLED, config.autoLoginEnabled),
@@ -252,23 +250,71 @@ function applyEnvOverrides(config: Config): Config {
   };
 }
 
+const BASE_CONFIG: Config = applyEnvOverrides(DEFAULTS);
+const configStorage = new AsyncLocalStorage<Config>();
+
 /**
- * Build final configuration
- * Priority: Defaults → Environment Variables → Tool Parameters (at runtime)
- * No config.json files - everything via ENV or tool parameters!
+ * Concurrency-safe configuration proxy:
+ * - Reads from the active AsyncLocalStorage store when inside `runWithConfig(...)`
+ * - Falls back to `BASE_CONFIG` otherwise
+ * - Startup mutations (e.g., `applyAccountToConfig`) update `BASE_CONFIG`
  */
-function buildConfig(): Config {
-  return applyEnvOverrides(DEFAULTS);
+export const CONFIG: Config = new Proxy(BASE_CONFIG, {
+  get(target, prop, receiver) {
+    const active = configStorage.getStore();
+    if (active && prop in active) {
+      return Reflect.get(active, prop, active);
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+  set(target, prop, value, receiver) {
+    const active = configStorage.getStore();
+    if (active) {
+      return Reflect.set(active, prop, value, active);
+    }
+    return Reflect.set(target, prop, value, receiver);
+  },
+  ownKeys(target) {
+    const active = configStorage.getStore();
+    return Reflect.ownKeys(active ?? target);
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const active = configStorage.getStore();
+    return Reflect.getOwnPropertyDescriptor(active ?? target, prop);
+  },
+});
+
+/**
+ * Execute an async operation with request-scoped configuration overrides.
+ * Concurrent calls never overwrite each other's settings.
+ */
+export function runWithConfig<T>(overrideConfig: Config, fn: () => Promise<T>): Promise<T> {
+  const cloned: Config = {
+    ...overrideConfig,
+    viewport: { ...overrideConfig.viewport },
+    notebookTopics: [...overrideConfig.notebookTopics],
+    notebookContentTypes: [...overrideConfig.notebookContentTypes],
+    notebookUseCases: [...overrideConfig.notebookUseCases],
+  };
+  return configStorage.run(cloned, fn);
 }
 
 /**
- * Global configuration instance
+ * Snapshot the currently effective configuration as a plain object.
  */
-export const CONFIG: Config = buildConfig();
+export function snapshotConfig(): Config {
+  const src = configStorage.getStore() ?? BASE_CONFIG;
+  return {
+    ...src,
+    viewport: { ...src.viewport },
+    notebookTopics: [...src.notebookTopics],
+    notebookContentTypes: [...src.notebookContentTypes],
+    notebookUseCases: [...src.notebookUseCases],
+  };
+}
 
 /**
  * Ensure all required directories exist
- * NOTE: We do NOT create configDir - it's not needed!
  */
 export function ensureDirectories(): void {
   const dirs = [
@@ -309,17 +355,15 @@ export interface BrowserOptions {
 }
 
 /**
- * Apply browser options to CONFIG (returns modified copy, doesn't mutate global CONFIG)
+ * Apply browser options to CONFIG (returns a new Config snapshot without mutating BASE_CONFIG)
  */
 export function applyBrowserOptions(options?: BrowserOptions, legacyShowBrowser?: boolean): Config {
-  const config = { ...CONFIG };
+  const config = snapshotConfig();
 
-  // Handle legacy show_browser parameter
   if (legacyShowBrowser !== undefined) {
     config.headless = !legacyShowBrowser;
   }
 
-  // Apply browser_options (takes precedence over legacy parameter)
   if (options) {
     if (options.show !== undefined) {
       config.headless = !options.show;
@@ -329,6 +373,7 @@ export function applyBrowserOptions(options?: BrowserOptions, legacyShowBrowser?
     }
     if (options.timeout_ms !== undefined) {
       config.browserTimeout = options.timeout_ms;
+      config.answerTimeoutMs = options.timeout_ms;
     }
     if (options.stealth) {
       const s = options.stealth;
@@ -352,5 +397,4 @@ export function applyBrowserOptions(options?: BrowserOptions, legacyShowBrowser?
   return config;
 }
 
-// Create directories on import
 ensureDirectories();

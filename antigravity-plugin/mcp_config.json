@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "notebooklm": {
+      "command": "node",
+      "args": [
+        "C:/Users/houss/.gemini/antigravity/scratch/notebooklm-mcp/dist/index.js"
+      ],
+      "env": {
+        "NOTEBOOKLM_PROFILE": "full"
+      },
+      "tools": {
+        "get_health": {
+          "eager": true
+        },
+        "ask_question": {
+          "eager": true
+        },
+        "list_notebooks": {
+          "eager": true
+        },
+        "create_notebook": {
+          "eager": true
+        },
+        "add_source": {
+          "eager": true
+        }
+      }
+    }
+  }
+}

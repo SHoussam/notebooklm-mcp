@@ -23,6 +23,7 @@ import {
   isChannelFailure,
   withChannel,
 } from "../browser/chromium-fallback.js";
+import { ensureBrowserWindowVisible } from "../browser/windows-foreground.js";
 import {
   humanType,
   randomDelay,
@@ -250,23 +251,283 @@ export class AuthManager {
   }
 
   /**
-   * Check if the saved state file is too old (>24 hours)
+   * Check if the saved state file is valid and not expired.
+   * Checks actual cookie expiration timestamps when available,
+   * falling back to a generous 30-day file age ceiling.
    */
   async isStateExpired(): Promise<boolean> {
     try {
+      const data = await fs.readFile(this.stateFilePath, "utf-8");
+      const state = JSON.parse(data) as {
+        cookies?: Array<{ name: string; expires?: number }>;
+      };
+
+      if (!Array.isArray(state.cookies) || state.cookies.length === 0) {
+        return true;
+      }
+
+      const criticalCookies = state.cookies.filter((c) =>
+        CRITICAL_COOKIE_NAMES.includes(c.name)
+      );
+
+      if (criticalCookies.length === 0) {
+        return true;
+      }
+
+      const now = Date.now() / 1000;
+      const cookiesWithExpiry = criticalCookies.filter(
+        (c) => typeof c.expires === "number" && c.expires > 0
+      );
+
+      if (cookiesWithExpiry.length > 0) {
+        const expired = cookiesWithExpiry.filter((c) => c.expires! < now);
+        if (expired.length === cookiesWithExpiry.length) {
+          log.warning("⚠️  All critical cookies with explicit expiry are expired.");
+          return true;
+        }
+      }
+
       const stats = await fs.stat(this.stateFilePath);
       const fileAgeSeconds = (Date.now() - stats.mtimeMs) / 1000;
-      const maxAgeSeconds = 24 * 60 * 60; // 24 hours
+      const maxAgeSeconds = 30 * 24 * 60 * 60; // 30 days
 
       if (fileAgeSeconds > maxAgeSeconds) {
-        const hoursOld = fileAgeSeconds / 3600;
-        log.warning(`⚠️  Saved state is ${hoursOld.toFixed(1)}h old (max: 24h)`);
+        const daysOld = fileAgeSeconds / 86400;
+        log.warning(`⚠️  Saved state is ${daysOld.toFixed(1)} days old (max: 30d)`);
         return true;
       }
 
       return false;
     } catch {
-      return true; // File doesn't exist = expired
+      return true; // File doesn't exist or is unparseable
+    }
+  }
+
+  /**
+   * Import cookies directly from a raw 'Cookie:' header string, JSON array,
+   * Playwright storageState JSON, or key-value map without opening a browser.
+   */
+  async importCookies(
+    rawInput: string | Array<Record<string, unknown>> | Record<string, unknown>
+  ): Promise<{
+    success: boolean;
+    message: string;
+    importedCount: number;
+    criticalFound: string[];
+    error?: string;
+  }> {
+    try {
+      interface PlaywrightCookie {
+        name: string;
+        value: string;
+        domain: string;
+        path: string;
+        expires: number;
+        httpOnly: boolean;
+        secure: boolean;
+        sameSite: "Strict" | "Lax" | "None";
+      }
+
+      const normalizedCookies: PlaywrightCookie[] = [];
+      const defaultExpiry = Math.floor(Date.now() / 1000) + 180 * 86400; // 180 days
+
+      const parseSingleCookie = (
+        name: string,
+        value: string,
+        domain?: string,
+        path?: string,
+        expires?: number,
+        httpOnly?: boolean,
+        secure?: boolean,
+        sameSite?: string
+      ) => {
+        const cleanName = name.trim();
+        const cleanVal = value.trim();
+        if (!cleanName) return;
+
+        const effectiveDomain = domain?.trim() || ".google.com";
+        const effectivePath = path?.trim() || "/";
+        const effectiveExpires =
+          typeof expires === "number" && expires > 0 ? expires : defaultExpiry;
+
+        let sSite: "Strict" | "Lax" | "None" = "None";
+        if (sameSite) {
+          const lower = sameSite.toLowerCase();
+          if (lower.includes("strict")) sSite = "Strict";
+          else if (lower.includes("lax")) sSite = "Lax";
+        }
+
+        normalizedCookies.push({
+          name: cleanName,
+          value: cleanVal,
+          domain: effectiveDomain,
+          path: effectivePath,
+          expires: effectiveExpires,
+          httpOnly: httpOnly ?? true,
+          secure: secure ?? true,
+          sameSite: sSite,
+        });
+
+        // Ensure NotebookLM origin also has OSID / __Secure-OSID if provided
+        if (cleanName.includes("OSID") && effectiveDomain !== "notebooklm.google.com") {
+          normalizedCookies.push({
+            name: cleanName,
+            value: cleanVal,
+            domain: "notebooklm.google.com",
+            path: effectivePath,
+            expires: effectiveExpires,
+            httpOnly: httpOnly ?? true,
+            secure: secure ?? true,
+            sameSite: sSite,
+          });
+        }
+      };
+
+      if (typeof rawInput === "string") {
+        let trimmed = rawInput.trim();
+        if (trimmed.toLowerCase().startsWith("cookie:")) {
+          trimmed = trimmed.slice(7).trim();
+        }
+
+        let parsedJson: unknown = null;
+        try {
+          parsedJson = JSON.parse(trimmed);
+        } catch {
+          parsedJson = null;
+        }
+
+        if (Array.isArray(parsedJson)) {
+          for (const item of parsedJson) {
+            if (item && typeof item === "object") {
+              const obj = item as Record<string, unknown>;
+              parseSingleCookie(
+                String(obj.name || ""),
+                String(obj.value || ""),
+                typeof obj.domain === "string" ? obj.domain : undefined,
+                typeof obj.path === "string" ? obj.path : undefined,
+                typeof obj.expirationDate === "number"
+                  ? obj.expirationDate
+                  : typeof obj.expires === "number"
+                    ? obj.expires
+                    : undefined,
+                typeof obj.httpOnly === "boolean" ? obj.httpOnly : undefined,
+                typeof obj.secure === "boolean" ? obj.secure : undefined,
+                typeof obj.sameSite === "string" ? obj.sameSite : undefined
+              );
+            }
+          }
+        } else if (
+          parsedJson &&
+          typeof parsedJson === "object" &&
+          Array.isArray((parsedJson as { cookies?: unknown[] }).cookies)
+        ) {
+          for (const item of (parsedJson as { cookies: Record<string, unknown>[] }).cookies) {
+            parseSingleCookie(
+              String(item.name || ""),
+              String(item.value || ""),
+              typeof item.domain === "string" ? item.domain : undefined,
+              typeof item.path === "string" ? item.path : undefined,
+              typeof item.expires === "number" ? item.expires : undefined,
+              typeof item.httpOnly === "boolean" ? item.httpOnly : undefined,
+              typeof item.secure === "boolean" ? item.secure : undefined,
+              typeof item.sameSite === "string" ? item.sameSite : undefined
+            );
+          }
+        } else if (parsedJson && typeof parsedJson === "object") {
+          for (const [k, v] of Object.entries(parsedJson as Record<string, unknown>)) {
+            if (typeof v === "string" || typeof v === "number") {
+              parseSingleCookie(k, String(v));
+            }
+          }
+        } else {
+          // Raw header string with name=value pairs separated by semicolon
+          const pairs = trimmed.split(";");
+          for (const pair of pairs) {
+            const eqIdx = pair.indexOf("=");
+            if (eqIdx > 0) {
+              const name = pair.slice(0, eqIdx).trim();
+              const value = pair.slice(eqIdx + 1).trim();
+              parseSingleCookie(name, value);
+            }
+          }
+        }
+      } else if (Array.isArray(rawInput)) {
+        for (const item of rawInput) {
+          if (item && typeof item === "object") {
+            const obj = item as Record<string, unknown>;
+            parseSingleCookie(
+              String(obj.name || ""),
+              String(obj.value || ""),
+              typeof obj.domain === "string" ? obj.domain : undefined,
+              typeof obj.path === "string" ? obj.path : undefined,
+              typeof obj.expirationDate === "number"
+                ? obj.expirationDate
+                : typeof obj.expires === "number"
+                  ? obj.expires
+                  : undefined,
+              typeof obj.httpOnly === "boolean" ? obj.httpOnly : undefined,
+              typeof obj.secure === "boolean" ? obj.secure : undefined,
+              typeof obj.sameSite === "string" ? obj.sameSite : undefined
+            );
+          }
+        }
+      } else if (rawInput && typeof rawInput === "object") {
+        for (const [k, v] of Object.entries(rawInput as Record<string, unknown>)) {
+          if (typeof v === "string" || typeof v === "number") {
+            parseSingleCookie(k, String(v));
+          }
+        }
+      }
+
+      if (normalizedCookies.length === 0) {
+        return {
+          success: false,
+          message: "No cookies could be parsed from the provided input.",
+          importedCount: 0,
+          criticalFound: [],
+          error: "Could not parse any cookies from input. Provide raw 'Cookie:' header or JSON array.",
+        };
+      }
+
+      const foundCritical = [
+        ...new Set(
+          normalizedCookies
+            .map((c) => c.name)
+            .filter((name) => CRITICAL_COOKIE_NAMES.includes(name))
+        ),
+      ];
+
+      const storageState = {
+        cookies: normalizedCookies,
+        origins: [
+          {
+            origin: "https://notebooklm.google.com",
+            localStorage: [],
+          },
+        ],
+      };
+
+      await fs.mkdir(path.dirname(this.stateFilePath), { recursive: true });
+      await fs.writeFile(this.stateFilePath, JSON.stringify(storageState, null, 2), "utf-8");
+
+      log.success(`✅ Imported ${normalizedCookies.length} cookies into ${this.stateFilePath}`);
+      log.success(`🔑 Critical Google cookies found: ${foundCritical.join(", ") || "none"}`);
+
+      return {
+        success: true,
+        message: `Successfully imported ${normalizedCookies.length} cookies. Session is now authenticated.`,
+        importedCount: normalizedCookies.length,
+        criticalFound: foundCritical,
+      };
+    } catch (error) {
+      log.error(`❌ Failed to import cookies: ${error}`);
+      return {
+        success: false,
+        message: `Failed to import cookies: ${error instanceof Error ? error.message : String(error)}`,
+        importedCount: 0,
+        criticalFound: [],
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -292,6 +553,7 @@ export class AuthManager {
 
       // Navigate to Google login (redirects to NotebookLM after auth)
       await page.goto(NOTEBOOKLM_AUTH_URL, { timeout: 60000 });
+      await ensureBrowserWindowVisible(page, CONFIG.chromeProfileDir);
 
       // Progress: Waiting for login
       await sendProgress?.("Waiting for manual login (up to 10 minutes)...", 4, 10);
@@ -931,13 +1193,14 @@ export class AuthManager {
       const baseLaunchOptions = {
         headless: !shouldShowBrowser,
         viewport: CONFIG.viewport,
-        locale: "en-US",
-        timezoneId: "Europe/Berlin",
+        locale: CONFIG.locale,
+        timezoneId: CONFIG.timezoneId,
         args: [
           "--disable-blink-features=AutomationControlled",
           "--disable-dev-shm-usage",
           "--no-first-run",
           "--no-default-browser-check",
+          ...(shouldShowBrowser ? ["--start-maximized", "--window-position=80,50"] : []),
         ],
       };
       const preferred = getPreferredChannel();
@@ -962,6 +1225,9 @@ export class AuthManager {
       // Get or create a page
       const pages = context.pages();
       const page = pages.length > 0 ? pages[0] : await context.newPage();
+      if (shouldShowBrowser) {
+        await ensureBrowserWindowVisible(page, CONFIG.chromeProfileDir);
+      }
 
       // Perform login with progress updates
       const loginSuccess = await this.performLogin(page, sendProgress);

@@ -1,44 +1,35 @@
 /**
- * NotebookLM source ingestion (issue #25).
+ * NotebookLM source ingestion & source listing.
  *
- * v2.0.0 supports the two source types that cover the bulk of real usage:
- *   - `url`  — paste a website URL (NotebookLM crawls and indexes it)
- *   - `text` — paste raw text (treated as a copied document)
+ * v2.1.0 supports four source types:
+ *   - `url`     — paste a website URL (NotebookLM crawls and indexes it)
+ *   - `youtube` — paste a YouTube video URL (NotebookLM indexes captions/transcript)
+ *   - `text`    — paste raw text (treated as a copied document)
+ *   - `file`    — upload a local file (.pdf, .txt, .md, .docx, .mp3, .wav, .m4a, images)
  *
- * File-upload, YouTube and Google-Drive ingestion are intentionally out of
- * scope for v2.0.0 — they require different overlay flows.
- *
- * Robustness strategy (2026-05, ported from the Fork's content-manager.ts):
- *
- *   1. Capture the *expected notebook UUID* from the URL up-front. NotebookLM
- *      sometimes redirects pasted-text uploads to a freshly-created notebook;
- *      we detect that and surface a clear error.
- *
- *   2. Resolve the dialog state defensively: if a dialog is already open we
- *      use it; otherwise we click the sidebar "Add source" button. The
- *      `[role="dialog"]` anchor is set synchronously on mount, so we do not
- *      have to race the Material `.mdc-dialog--open` animation class.
- *
- *   3. Source-type buttons no longer ship with aria-labels — see
- *      selectors.ts for the icon-/text-based anchors.
- *
- *   4. Insert verification is COUNT-BASED: snapshot
- *      `.single-source-container` count before the submit click, then poll
- *      after the dialog closes (up to 90 s — URL crawls are slow).
+ * Also exposes `listSources(page)` to enumerate the sources currently loaded
+ * in a notebook's left-hand Sources sidebar.
  */
 
 import type { Page } from "patchright";
+import fs from "fs";
+import path from "path";
 import { Selectors, joinAlt } from "./selectors.js";
 import { safeSleep, isRecoverable } from "../browser/watchdog.js";
 import { log } from "../utils/logger.js";
 
-export type SourceType = "url" | "text";
+export type SourceType = "url" | "youtube" | "text" | "file";
 
 export interface AddSourceInput {
   type: SourceType;
-  /** URL when `type === "url"`, raw text when `type === "text"`. */
+  /**
+   * - `url`: https://... website URL
+   * - `youtube`: https://www.youtube.com/watch?v=... or https://youtu.be/...
+   * - `text`: raw text body
+   * - `file`: local file path (.pdf, .txt, .md, .docx, audio, image)
+   */
   content: string;
-  /** Optional title shown in the source list. NotebookLM uses a default if omitted. */
+  /** Optional title shown in the source list (used for `text` sources). */
   title?: string;
 }
 
@@ -47,7 +38,18 @@ export interface AddSourceResult {
   type: SourceType;
   sourceCountBefore: number;
   sourceCountAfter: number;
+  resolvedFilePath?: string;
   message?: string;
+}
+
+export interface NotebookSourceEntry {
+  index: number;
+  title: string;
+}
+
+export interface ListSourcesResult {
+  count: number;
+  sources: NotebookSourceEntry[];
 }
 
 export async function addSource(page: Page, input: AddSourceInput): Promise<AddSourceResult> {
@@ -55,56 +57,78 @@ export async function addSource(page: Page, input: AddSourceInput): Promise<AddS
   const expectedUuid = initialUrl.match(/notebook\/([a-f0-9-]+)/)?.[1];
   log.info(`📄 [add_source] type=${input.type} target_uuid=${expectedUuid ?? "?"}`);
 
+  // Pre-validate local file path before touching the browser
+  let resolvedFilePath: string | undefined;
+  if (input.type === "file") {
+    resolvedFilePath = path.resolve(input.content.trim());
+    if (!fs.existsSync(resolvedFilePath)) {
+      return {
+        success: false,
+        type: "file",
+        sourceCountBefore: 0,
+        sourceCountAfter: 0,
+        resolvedFilePath,
+        message: `Local file does not exist: ${resolvedFilePath}`,
+      };
+    }
+    const stat = fs.statSync(resolvedFilePath);
+    if (!stat.isFile()) {
+      return {
+        success: false,
+        type: "file",
+        sourceCountBefore: 0,
+        sourceCountAfter: 0,
+        resolvedFilePath,
+        message: `Path is not a regular file: ${resolvedFilePath}`,
+      };
+    }
+  }
+
   try {
-    // 1. Open the Add-source dialog (or use one that's already open).
+    const before = await countSources(page);
+    log.info(`  📊 source count before add_source: ${before}`);
+
+    // 1. Open the Add-source dialog (or reuse if already open).
     await openAddSourceOverlay(page);
 
-    // 2. Pick the source type if there is a picker. Some overlay variants
-    //    drop straight into an input field; pickSourceType is a no-op then.
-    await pickSourceType(page, input.type);
+    if (input.type === "file") {
+      await uploadLocalFileSource(page, resolvedFilePath!);
+    } else {
+      // 2. Pick source type (`url`, `youtube`, or `text`).
+      await pickSourceType(page, input.type);
 
-    // 3. Fill the content + optional title.
-    await fillSourceContent(page, input);
+      // 3. Fill URL or text content + optional title.
+      await fillSourceContent(page, input);
 
-    // 4. Snapshot the source count *before* submitting. The Fork captures it
-    //    here (dialog still open, sidebar list not yet updated) so the
-    //    post-close poll can detect a real increment.
-    const before = await countSources(page);
-    log.info(`  📊 source count before submit: ${before}`);
+      // 4. Confirm insertion.
+      await confirmInsert(page);
+    }
 
-    // 5. Click the primary "Insert" / "Hinzufügen" button.
-    await confirmInsert(page);
-
-    // 6. Wait for the dialog to animate away. NotebookLM doesn't append the
-    //    new sidebar entry until the modal is fully gone.
+    // 5. Wait for the modal to close so sidebar updates can flush.
     await waitForOverlayToClose(page);
 
-    // 7. UUID redirect check: pasted-text uploads occasionally land in a new
-    //    "Untitled notebook" instead of the target. Catch that here so the
-    //    caller sees a useful error instead of a phantom success.
+    // 6. Guard against NotebookLM's pasted-text redirect quirk.
     if (expectedUuid) {
       const currentUrl = page.url();
       const currentUuid = currentUrl.match(/notebook\/([a-f0-9-]+)/)?.[1];
       if (currentUuid && currentUuid !== expectedUuid) {
-        log.error(
-          `  ❌ Notebook redirect: expected ${expectedUuid}, got ${currentUuid}`
-        );
+        log.error(`  ❌ Notebook redirect: expected ${expectedUuid}, got ${currentUuid}`);
         return {
           success: false,
           type: input.type,
           sourceCountBefore: before,
           sourceCountAfter: before,
+          ...(resolvedFilePath && { resolvedFilePath }),
           message:
             `NotebookLM redirected to a different notebook (${currentUuid}) instead of ` +
-            `the target (${expectedUuid}). This is a known quirk for pasted-text uploads — ` +
-            `the source landed in a new "Untitled notebook".`,
+            `the target (${expectedUuid}). Known quirk for pasted-text uploads.`,
         };
       }
     }
 
-    // 8. Poll the source count for up to 90 s; URL crawls and large pastes
-    //    can take a while to materialise as a sidebar entry.
-    const after = await waitForSourceCountIncrease(page, before, 90_000);
+    // 7. Poll source count (up to 120 s for large PDFs / audio / URL crawls).
+    const pollTimeoutMs = input.type === "file" ? 120_000 : 90_000;
+    const after = await waitForSourceCountIncrease(page, before, pollTimeoutMs);
 
     if (after > before) {
       log.success(`  ✅ source added (count ${before} → ${after})`);
@@ -113,20 +137,21 @@ export async function addSource(page: Page, input: AddSourceInput): Promise<AddS
         type: input.type,
         sourceCountBefore: before,
         sourceCountAfter: after,
+        ...(resolvedFilePath && { resolvedFilePath }),
       };
     }
 
-    // 9. Last-ditch: maybe an error toast surfaced; surface it verbatim.
     const errorText = await readDialogError(page);
     return {
       success: false,
       type: input.type,
       sourceCountBefore: before,
       sourceCountAfter: after,
+      ...(resolvedFilePath && { resolvedFilePath }),
       message:
         errorText ||
-        "Source dialog completed but the source list did not grow within 90 s. " +
-          "Either NotebookLM is still crawling/indexing or the upload silently failed.",
+        `Source dialog completed but the source list did not grow within ${pollTimeoutMs / 1000} s. ` +
+          "Either NotebookLM is still indexing a large file or the source was rejected.",
     };
   } catch (err) {
     if (isRecoverable(err)) throw err;
@@ -136,25 +161,105 @@ export async function addSource(page: Page, input: AddSourceInput): Promise<AddS
       type: input.type,
       sourceCountBefore: 0,
       sourceCountAfter: 0,
+      ...(resolvedFilePath && { resolvedFilePath }),
       message: err instanceof Error ? err.message : String(err),
     };
   }
 }
 
 /**
- * Count sources in the sidebar via two independent anchors:
- *
- *   1. `.single-source-container` — the per-row sidebar element. Most
- *      direct, but only present once the sidebar has hydrated.
- *
- *   2. `.cover-subtitle-source-count` — a header label of the form
- *      `"3 Quellen"` / `"3 sources"`. Robust to a collapsed or partially
- *      hydrated sidebar because it lives in the chat header instead.
- *
- * We return whichever produces a higher count; mismatches between the two
- * usually mean the sidebar hasn't caught up yet, in which case the header
- * is the authoritative ground truth.
+ * Upload a local file into the open Add-source modal.
+ * Tries direct `<input type="file">` binding first, then falls back to
+ * intercepting a native `filechooser` event from clicking the upload button.
  */
+async function uploadLocalFileSource(page: Page, filePath: string): Promise<void> {
+  log.info(`  📤 Uploading local file: ${filePath}`);
+
+  // Path A: Direct <input type="file"> element attached in DOM
+  const fileInput = page.locator(Selectors.sources.fileInput).first();
+  const attachedCount = await page
+    .locator(Selectors.sources.fileInput)
+    .count()
+    .catch(() => 0);
+
+  if (attachedCount > 0) {
+    await fileInput.setInputFiles(filePath);
+    log.success("  ✅ File attached via <input type='file'>");
+    await safeSleep(page, 600);
+    return;
+  }
+
+  // Path B: Click the Upload button while awaiting Playwright's filechooser event
+  const overlay = page.locator(Selectors.sources.overlayPane).first();
+  for (const sel of Selectors.sources.sourceTypeFile) {
+    const btn = overlay.locator(sel).first();
+    if (await btn.isVisible({ timeout: 1_000 }).catch(() => false)) {
+      const chooserPromise = page.waitForEvent("filechooser", { timeout: 10_000 });
+      await btn.click();
+      const chooser = await chooserPromise;
+      await chooser.setFiles(filePath);
+      log.success(`  ✅ File attached via filechooser (${sel})`);
+      await safeSleep(page, 600);
+      return;
+    }
+  }
+
+  throw new Error(
+    "Could not locate file upload input or upload button inside the Add-source dialog."
+  );
+}
+
+/**
+ * List all sources currently visible in the notebook's Sources sidebar.
+ */
+export async function listSources(page: Page): Promise<ListSourcesResult> {
+  const totalCount = await countSources(page);
+  const sources: NotebookSourceEntry[] = [];
+
+  try {
+    const rows = page.locator(Selectors.sources.sourceContainer);
+    const rowCount = await rows.count();
+    for (let i = 0; i < rowCount; i++) {
+      const row = rows.nth(i);
+      let title = "";
+      for (const titleSel of Selectors.sources.sourceTitle) {
+        const sub = row.locator(titleSel).first();
+        if ((await sub.count().catch(() => 0)) > 0) {
+          const text = (await sub.innerText({ timeout: 500 }).catch(() => "")).trim();
+          if (text) {
+            title = text;
+            break;
+          }
+        }
+      }
+      if (!title) {
+        const raw = (await row.innerText({ timeout: 500 }).catch(() => "")).trim();
+        title =
+          raw
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(
+              (l) =>
+                l &&
+                !Selectors.uiControlLabels.has(l) &&
+                l !== "check_box" &&
+                l !== "check_box_outline_blank"
+            )[0] ?? "";
+      }
+      if (title) {
+        sources.push({ index: i + 1, title });
+      }
+    }
+  } catch (err) {
+    log.warning(`  ⚠️  listSources partial read error: ${err}`);
+  }
+
+  return {
+    count: Math.max(totalCount, sources.length),
+    sources,
+  };
+}
+
 export async function countSources(page: Page): Promise<number> {
   let containerCount = 0;
   try {
@@ -166,7 +271,7 @@ export async function countSources(page: Page): Promise<number> {
   let headerCount = 0;
   try {
     const headerText = await page
-      .locator(".cover-subtitle-source-count")
+      .locator(Selectors.sources.sourceCountIndicator)
       .first()
       .textContent({ timeout: 500 })
       .catch(() => null);
@@ -179,34 +284,25 @@ export async function countSources(page: Page): Promise<number> {
   return Math.max(containerCount, headerCount);
 }
 
-/**
- * Open the Add-source modal. Order of attempts:
- *   1. Dialog already open → use it (auto-modal on fresh notebooks).
- *   2. Click the sidebar "Add source" button.
- *   3. Last resort: navigate to `?addSource=true`, which auto-opens.
- */
 async function openAddSourceOverlay(page: Page): Promise<void> {
   if (await isOverlayVisible(page)) {
     log.info("  ✅ Add-source dialog already open, reusing");
     return;
   }
 
-  // Try the sidebar button first — fastest path on a populated notebook.
   try {
-    await page
-      .locator(joinAlt(Selectors.sources.addButton))
-      .first()
-      .click({ timeout: 5_000 });
+    await page.locator(joinAlt(Selectors.sources.addButton)).first().click({ timeout: 5_000 });
     await page
       .locator(Selectors.sources.overlayPane)
       .first()
       .waitFor({ state: "visible", timeout: 8_000 });
     return;
   } catch (err) {
-    log.warning(`  ⚠️  Add-source button click failed (${err}), trying ?addSource=true URL fallback`);
+    log.warning(
+      `  ⚠️  Add-source button click failed (${err}), trying ?addSource=true URL fallback`
+    );
   }
 
-  // URL fallback — useful when the sidebar button is hidden or covered.
   const url = page.url();
   if (url && /\/notebook\//.test(url) && !url.includes("addSource=true")) {
     const u = new URL(url);
@@ -230,34 +326,42 @@ async function isOverlayVisible(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-async function pickSourceType(page: Page, type: SourceType): Promise<void> {
+async function pickSourceType(page: Page, type: Exclude<SourceType, "file">): Promise<void> {
   const candidates =
-    type === "url" ? Selectors.sources.sourceTypeUrl : Selectors.sources.sourceTypeText;
+    type === "youtube"
+      ? [...Selectors.sources.sourceTypeYoutube, ...Selectors.sources.sourceTypeUrl]
+      : type === "url"
+        ? Selectors.sources.sourceTypeUrl
+        : Selectors.sources.sourceTypeText;
+
   const overlay = page.locator(Selectors.sources.overlayPane).first();
   for (const sel of candidates) {
     const target = overlay.locator(sel).first();
     if (await target.isVisible({ timeout: 1_000 }).catch(() => false)) {
       await target.click();
-      // Sub-dialog needs a moment to hydrate before we type.
       await safeSleep(page, 500);
       return;
     }
   }
-  // Older overlays drop straight to the input (no type picker) — that's fine.
 }
 
 async function fillSourceContent(page: Page, input: AddSourceInput): Promise<void> {
   const overlay = page.locator(Selectors.sources.overlayPane).first();
 
-  // Wait for the overlay to actually contain a textarea (the picker swap is
-  // animated, so a tight 500 ms wait beats a busy poll).
   await safeSleep(page, 500);
 
-  const inputCandidates = [
-    Selectors.sources.overlayTextarea,
-    Selectors.sources.overlayInput,
-    `${Selectors.sources.overlayPane} textarea:not(.query-box-input):not(.query-box-textarea)`,
-  ];
+  const inputCandidates =
+    input.type === "url" || input.type === "youtube"
+      ? [
+          Selectors.sources.overlayInput,
+          Selectors.sources.overlayTextarea,
+          `${Selectors.sources.overlayPane} textarea:not(.query-box-input):not(.query-box-textarea)`,
+        ]
+      : [
+          Selectors.sources.overlayTextarea,
+          Selectors.sources.overlayInput,
+          `${Selectors.sources.overlayPane} textarea:not(.query-box-input):not(.query-box-textarea)`,
+        ];
 
   let target = null;
   for (const sel of inputCandidates) {
@@ -271,12 +375,10 @@ async function fillSourceContent(page: Page, input: AddSourceInput): Promise<voi
   if (!target) {
     throw new Error(
       "Could not find an input field inside the Add-source overlay. " +
-        "NotebookLM UI may have changed — please file an issue."
+        "NotebookLM UI may have changed."
     );
   }
 
-  // Title goes in a separate input when one is present; otherwise we prefix
-  // it onto the text content (Fork's fallback for older overlays).
   let body = input.content;
   if (input.title && input.type === "text") {
     let titleInputFound = false;
@@ -300,8 +402,6 @@ async function fillSourceContent(page: Page, input: AddSourceInput): Promise<voi
   }
 
   await target.fill(body);
-  // Small settle delay before clicking submit; Material's primary button
-  // briefly stays disabled after `fill()` while validators run.
   await safeSleep(page, 300);
 }
 
@@ -317,15 +417,10 @@ async function confirmInsert(page: Page): Promise<void> {
       return;
     }
   }
-  // Fallback: pressing Enter in many flows submits the form.
   log.warning("  ⚠️  No insert button matched, pressing Enter as fallback");
   await page.keyboard.press("Enter");
 }
 
-/**
- * Wait until the Add-source modal animates away. NotebookLM only appends the
- * new sidebar entry once the modal is fully gone, so we *must* wait here.
- */
 async function waitForOverlayToClose(page: Page, timeoutMs: number = 30_000): Promise<void> {
   await page
     .locator(Selectors.sources.overlayPane)
@@ -348,11 +443,6 @@ async function waitForSourceCountIncrease(
   return await countSources(page);
 }
 
-/**
- * Look for an error toast / `[role="alert"]` describing why the upload
- * failed. We filter against Material-icon-name leakage (e.g. `more_vert`),
- * which would otherwise produce nonsense error strings.
- */
 async function readDialogError(page: Page): Promise<string | null> {
   const errorSelectors = [
     '[role="alert"]:visible',

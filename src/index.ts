@@ -1,35 +1,21 @@
 #!/usr/bin/env node
 
 /**
- * NotebookLM MCP Server
+ * NotebookLM MCP Server (v2.1.0)
  *
- * MCP Server for Google NotebookLM - Chat with Gemini 2.5 through NotebookLM
- * with session support and human-like behavior!
+ * MCP Server for Google NotebookLM — research, source ingestion (URL, YouTube,
+ * raw text, PDF/files), remote notebook creation & discovery, citation-grounded
+ * Q&A, Audio Overviews, and full Studio Artifacts (Video, Mind Map, Slide Deck,
+ * Infographic, Flashcards, Quiz, Briefing Doc, Study Guide, FAQ, Timeline).
  *
- * Features:
- * - Session-based contextual conversations
- * - Auto re-login on session expiry
- * - Human-like typing and mouse movements
- * - Persistent browser fingerprint
- * - Stealth mode with Patchright
- * - Claude Code integration via npx
- *
- * Usage:
- *   npx notebooklm-mcp
- *   node dist/index.js
- *
- * Environment Variables:
- *   NOTEBOOK_URL - Default NotebookLM notebook URL
- *   AUTO_LOGIN_ENABLED - Enable automatic login (true/false)
- *   LOGIN_EMAIL - Google email for auto-login
- *   LOGIN_PASSWORD - Google password for auto-login
- *   HEADLESS - Run browser in headless mode (true/false)
- *   MAX_SESSIONS - Maximum concurrent sessions (default: 10)
- *   SESSION_TIMEOUT - Session timeout in seconds (default: 900)
- *
- * Based on the Python NotebookLM API implementation
+ * Transports:
+ *   - stdio (default): `node dist/index.js`
+ *   - Streamable HTTP (multi-session): `node dist/index.js --transport http --port 3000`
  */
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -43,88 +29,75 @@ import { ToolHandlers, buildToolDefinitions } from "./tools/index.js";
 import { ResourceHandlers } from "./resources/resource-handlers.js";
 import { SettingsManager } from "./utils/settings-manager.js";
 import { CliHandler } from "./utils/cli-handler.js";
-import { CONFIG, ensureDirectories } from "./config.js";
-import { startHttpTransport } from "./transport/http.js";
+import { CONFIG, ensureDirectories, type BrowserOptions } from "./config.js";
+import { startHttpTransport, type HttpTransportHandle } from "./transport/http.js";
+import type { SourceType } from "./notebooklm/sources.js";
+import type { StudioArtifactType } from "./notebooklm/studio.js";
 import { log } from "./utils/logger.js";
+
+export const SERVER_VERSION = "2.1.0";
 
 /**
  * Server-level instructions consumed by MCP clients during initialization.
- * Per the MCP spec, these describe **cross-tool workflows, ID flows, and
- * constraints** so an LLM agent can use the server end-to-end without prior
- * context. We deliberately keep individual tool descriptions terse — no
- * duplicating workflow advice across every tool.
- *
- * Reference: modelcontextprotocol typescript-sdk → "Server instructions".
  */
-const SERVER_INSTRUCTIONS = `# notebooklm-mcp — research with Google NotebookLM
+export const SERVER_INSTRUCTIONS = `# notebooklm-mcp v2.1.0 — research & Studio automation with Google NotebookLM
 
-This server lets an LLM run a fully session-based research workflow against
-a NotebookLM notebook (chat with Gemini 2.5 grounded on user-uploaded
-sources, ingest sources, generate Audio Overviews).
+This server lets an AI agent run an end-to-end session-based research workflow
+against Google NotebookLM: create or discover notebooks, upload local files
+(PDF/MD/TXT/DOCX/audio), YouTube videos, URLs, or text snippets, run multi-turn
+citation-grounded Q&A, and generate/export Studio artifacts.
 
 ## First-run flow
 
-1. \`get_health\` → if \`authenticated=false\`, run \`setup_auth\` (opens
-   a browser tab — user logs in once, cookies persist).
-2. \`add_notebook\` to register a NotebookLM share-URL into the local
-   library (the user must provide the URL — see add_notebook for the link
-   workflow). Optionally \`select_notebook\` to make it the default.
-3. \`ask_question\` — start asking. Save the returned \`session_id\` and
-   reuse it for follow-up questions to keep context.
+1. \`get_health\` → if \`authenticated=false\`, run \`setup_auth\` (opens a
+   visible browser window — sign in to Google once and cookies persist).
+2. Either:
+   - \`create_notebook\` to create a brand-new NotebookLM notebook and make it active,
+   - \`discover_notebooks\` to scan existing notebooks on the signed-in Google account, or
+   - \`add_notebook\` to register a NotebookLM URL into the local library.
+3. Populate with \`add_source\` (\`url\`, \`youtube\`, \`text\`, or \`file\`), inspect
+   loaded sources via \`list_sources\`, and query with \`ask_question\` (pass
+   \`source_format: "inline" | "footnotes" | "json"\` when structured citations are needed).
 
-## Notebook ID flow
+## Session ID & Notebook ID flows
 
-\`list_notebooks\` / \`search_notebooks\` / \`get_notebook\` all return
-notebook objects with an \`id\` field. That \`id\` feeds
-\`select_notebook\`, \`update_notebook\`, \`remove_notebook\`, and the
-optional \`notebook_id\` argument on \`ask_question\` / \`add_source\` /
-audio tools.
+- \`list_notebooks\` / \`search_notebooks\` / \`get_notebook\` / \`create_notebook\`
+  return notebook entries with \`id\`. Pass \`notebook_id\` (or \`select_notebook\`
+  once) to target that notebook across \`ask_question\`, \`add_source\`,
+  \`list_sources\`, audio, and Studio tools.
+- \`ask_question\` returns \`session_id\`. Reuse \`session_id\` on follow-up
+  calls to preserve multi-turn conversational context and avoid reloading the tab.
 
-## Session ID flow
+## Source ingestion (\`add_source\` & \`list_sources\`)
 
-\`ask_question\` returns \`session_id\` on every call. Pass that same id
-back as \`session_id\` on later \`ask_question\` calls to maintain a
-conversational context (NotebookLM uses session-RAG so follow-ups get
-sharper). \`list_sessions\` enumerates live sessions; \`reset_session\`
-clears chat history (same id), \`close_session\` ends a session.
+Call \`add_source\` once per source:
+- \`type: "file"\` — absolute path to a local \`.pdf\`, \`.md\`, \`.txt\`, \`.docx\`, audio, or image file
+- \`type: "youtube"\` — YouTube video URL (transcripts/captions indexed)
+- \`type: "url"\` — web page URL
+- \`type: "text"\` — raw copied text (with optional \`title\`)
 
-## Source ingestion (multi-source)
+## Studio Artifacts & Audio Overview (async chain)
 
-Call \`add_source\` once per source — text snippets and URLs are supported.
-NotebookLM crawls/indexes each source asynchronously; new sources are
-typically queryable within 5–30 seconds after \`add_source\` succeeds.
+\`generate_studio_artifact\` supports 11 Studio outputs:
+\`audio\`, \`video\`, \`mindmap\`, \`slide_deck\`, \`infographic\`, \`flashcards\`,
+\`quiz\`, \`briefing_doc\`, \`study_guide\`, \`faq\`, and \`timeline\`.
 
-## Audio Overview (async chain — important)
+1. Call \`generate_studio_artifact\` (non-blocking by default; returns \`started\`).
+2. Poll \`get_studio_status\` until the artifact's status is \`ready\`.
+3. Call \`export_studio_artifact\` with an absolute \`destination_dir\` to download
+   binary media (Audio, Video, Slides, Infographic, Mind Map) or save extracted
+   Markdown (\`.md\`) for Reports, Flashcards, and Quizzes.
 
-\`generate_audio\` is **non-blocking** by default: it triggers the render
-and returns immediately with \`status: "started"\` (or \`"in_progress"\` if
-a generation was already running, or \`"ready"\` if one already existed).
-Generation typically takes 2–10 minutes.
-
-To complete the workflow, poll \`get_audio_status\` every ~30 s. When it
-returns \`status: "ready"\`, call \`download_audio\` with an absolute
-\`destination_dir\` to save the file. Calling \`download_audio\` before
-\`ready\` will surface a clear error.
-
-For synchronous behaviour pass \`wait_for_completion: true\` to
-\`generate_audio\` (legacy mode — blocks for up to \`timeout_ms\`).
+(Dedicated \`generate_audio\` → \`get_audio_status\` → \`download_audio\` tools
+remain available for backwards compatibility.)
 
 ## Constraints
 
-- Free Google accounts: 50 NotebookLM queries/day. \`re_auth\` rotates
-  accounts.
-- Session timeout: ~15 min idle (see \`get_health.session_timeout\`).
-- File / YouTube / Drive source uploads are not yet implemented in v2.0.
-- Audio Overview is the only Studio output exposed in v2.0; Video,
-  Presentation, Mindmap, Flashcards, Quiz, Infographic, and Datatable are
-  generated by NotebookLM but not yet wrapped by this server.
+- Free Google accounts: ~50 NotebookLM queries/day, 100 notebooks, 50 sources/notebook
+  (5× higher on Google AI Pro/Ultra). Use \`re_auth\` or \`--account <name>\` to switch accounts.
+- Idle browser sessions auto-close after \`get_health.session_timeout\` seconds (~15 min).
 `;
 
-/**
- * MCP progress tokens are carried in `_meta.progressToken` on the tool-call
- * arguments object. The SDK types arguments as `Record<string, unknown>`,
- * so we narrow defensively.
- */
 function extractProgressToken(
   args: Record<string, unknown> | undefined
 ): string | number | undefined {
@@ -135,25 +108,68 @@ function extractProgressToken(
   return typeof token === "string" || typeof token === "number" ? token : undefined;
 }
 
+export interface NotebookLMMCPServerOptions {
+  /** Register process SIGINT/SIGTERM/uncaught handlers. Default: true (set false in tests). */
+  registerSignalHandlers?: boolean;
+}
+
 /**
- * Main MCP Server Class
+ * Main MCP Server Coordinator.
+ *
+ * Owns shared domain state (`AuthManager`, `SessionManager`, `NotebookLibrary`,
+ * `SettingsManager`) and constructs one MCP `Server` protocol instance per
+ * transport connection so multi-client Streamable-HTTP works without colliding
+ * on a single `Server.connect()` call.
  */
-class NotebookLMMCPServer {
-  private server: Server;
+export class NotebookLMMCPServer {
+  private protocolServers = new Set<Server>();
+  private httpHandle: HttpTransportHandle | null = null;
   private authManager: AuthManager;
   private sessionManager: SessionManager;
   private library: NotebookLibrary;
   private toolHandlers: ToolHandlers;
   private resourceHandlers: ResourceHandlers;
   private settingsManager: SettingsManager;
-  private toolDefinitions: Tool[];
 
-  constructor() {
-    // Initialize MCP Server
-    this.server = new Server(
+  constructor(options: NotebookLMMCPServerOptions = {}) {
+    this.authManager = new AuthManager();
+    this.sessionManager = new SessionManager(this.authManager);
+    this.library = new NotebookLibrary();
+    this.settingsManager = new SettingsManager();
+
+    this.toolHandlers = new ToolHandlers(this.sessionManager, this.authManager, this.library);
+    this.resourceHandlers = new ResourceHandlers(this.library);
+
+    if (options.registerSignalHandlers !== false) {
+      this.setupShutdownHandlers();
+    }
+
+    const activeSettings = this.settingsManager.getEffectiveSettings();
+    const initialTools = this.getFilteredTools();
+    log.info("🚀 NotebookLM MCP Server initialized");
+    log.info(`  Version: ${SERVER_VERSION}`);
+    log.info(`  Node: ${process.version}`);
+    log.info(`  Platform: ${process.platform}`);
+    log.info(`  Profile: ${activeSettings.profile} (${initialTools.length} tools active)`);
+  }
+
+  /**
+   * Build the active tool list dynamically (reflects active notebook updates & profile filter).
+   */
+  public getFilteredTools(): Tool[] {
+    const allTools = buildToolDefinitions(this.library) as Tool[];
+    return this.settingsManager.filterTools(allTools);
+  }
+
+  /**
+   * Create a fresh MCP protocol `Server` instance wired to shared handlers.
+   * Safe to invoke once for stdio or once per incoming HTTP session.
+   */
+  public createProtocolServer(): Server {
+    const protocolServer = new Server(
       {
         name: "notebooklm-mcp",
-        version: "2.0.0",
+        version: SERVER_VERSION,
       },
       {
         capabilities: {
@@ -161,59 +177,32 @@ class NotebookLMMCPServer {
           resources: {},
           resourceTemplates: {},
           prompts: {},
-          completions: {}, // Required for completion/complete support
+          completions: {},
           logging: {},
         },
-        // MCP-spec server instructions (clients merge into the system prompt).
-        // Use these for cross-tool workflow guidance — do not duplicate
-        // information that already lives in individual tool descriptions.
         instructions: SERVER_INSTRUCTIONS,
       }
     );
 
-    // Initialize managers
-    this.authManager = new AuthManager();
-    this.sessionManager = new SessionManager(this.authManager);
-    this.library = new NotebookLibrary();
-    this.settingsManager = new SettingsManager();
-
-    // Initialize handlers
-    this.toolHandlers = new ToolHandlers(this.sessionManager, this.authManager, this.library);
-    this.resourceHandlers = new ResourceHandlers(this.library);
-
-    // Build and Filter tool definitions
-    const allTools = buildToolDefinitions(this.library) as Tool[];
-    this.toolDefinitions = this.settingsManager.filterTools(allTools);
-
-    // Setup handlers
-    this.setupHandlers();
-    this.setupShutdownHandlers();
-
-    const activeSettings = this.settingsManager.getEffectiveSettings();
-    log.info("🚀 NotebookLM MCP Server initialized");
-    log.info(`  Version: 2.0.0`);
-    log.info(`  Node: ${process.version}`);
-    log.info(`  Platform: ${process.platform}`);
-    log.info(`  Profile: ${activeSettings.profile} (${this.toolDefinitions.length} tools active)`);
+    this.setupHandlers(protocolServer);
+    this.protocolServers.add(protocolServer);
+    return protocolServer;
   }
 
   /**
-   * Setup MCP request handlers
+   * Wire MCP request handlers onto a protocol `Server` instance.
    */
-  private setupHandlers(): void {
-    // Register Resource Handlers (Resources, Templates, Completions)
-    this.resourceHandlers.registerHandlers(this.server);
+  private setupHandlers(protocolServer: Server): void {
+    this.resourceHandlers.registerHandlers(protocolServer);
 
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    protocolServer.setRequestHandler(ListToolsRequestSchema, async () => {
       log.info("📋 [MCP] list_tools request received");
       return {
-        tools: this.toolDefinitions,
+        tools: this.getFilteredTools(),
       };
     });
 
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    protocolServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       const progressToken = extractProgressToken(args);
 
@@ -222,10 +211,9 @@ class NotebookLMMCPServer {
         log.info(`  📊 Progress token: ${progressToken}`);
       }
 
-      // Create progress callback function
       const sendProgress = async (message: string, progress?: number, total?: number) => {
         if (progressToken) {
-          await this.server.notification({
+          await protocolServer.notification({
             method: "notifications/progress",
             params: {
               progressToken,
@@ -250,9 +238,28 @@ class NotebookLMMCPServer {
                 notebook_id?: string;
                 notebook_url?: string;
                 show_browser?: boolean;
+                browser_options?: BrowserOptions;
                 source_format?: "none" | "inline" | "footnotes" | "json";
               },
               sendProgress
+            );
+            break;
+
+          case "create_notebook":
+            result = await this.toolHandlers.handleCreateNotebook(
+              args as {
+                title: string;
+                description?: string;
+                topics?: string[];
+                add_to_library?: boolean;
+                show_browser?: boolean;
+              }
+            );
+            break;
+
+          case "discover_notebooks":
+            result = await this.toolHandlers.handleDiscoverNotebooks(
+              (args ?? {}) as { show_browser?: boolean }
             );
             break;
 
@@ -327,38 +334,58 @@ class NotebookLMMCPServer {
 
           case "setup_auth":
             result = await this.toolHandlers.handleSetupAuth(
-              args as { show_browser?: boolean },
+              (args ?? {}) as { show_browser?: boolean; browser_options?: BrowserOptions },
               sendProgress
             );
             break;
 
           case "re_auth":
             result = await this.toolHandlers.handleReAuth(
-              args as { show_browser?: boolean },
+              (args ?? {}) as { show_browser?: boolean; browser_options?: BrowserOptions },
               sendProgress
             );
             break;
 
+          case "set_auth_cookies":
+            result = await this.toolHandlers.handleSetAuthCookies(
+              (args ?? {}) as { cookies?: string; raw_cookie_header?: string; token?: string }
+            );
+            break;
+
           case "cleanup_data":
-            result = await this.toolHandlers.handleCleanupData(args as { confirm: boolean });
+            result = await this.toolHandlers.handleCleanupData(
+              args as { confirm: boolean; preserve_library?: boolean }
+            );
             break;
 
           case "add_source":
             result = await this.toolHandlers.handleAddSource(
               args as {
-                type: "url" | "text";
+                type: SourceType;
                 content: string;
                 title?: string;
                 session_id?: string;
                 notebook_id?: string;
                 notebook_url?: string;
+                show_browser?: boolean;
+              }
+            );
+            break;
+
+          case "list_sources":
+            result = await this.toolHandlers.handleListSources(
+              (args ?? {}) as {
+                session_id?: string;
+                notebook_id?: string;
+                notebook_url?: string;
+                show_browser?: boolean;
               }
             );
             break;
 
           case "generate_audio":
             result = await this.toolHandlers.handleGenerateAudio(
-              args as {
+              (args ?? {}) as {
                 custom_prompt?: string;
                 timeout_ms?: number;
                 wait_for_completion?: boolean;
@@ -372,7 +399,7 @@ class NotebookLMMCPServer {
 
           case "get_audio_status":
             result = await this.toolHandlers.handleGetAudioStatus(
-              args as {
+              (args ?? {}) as {
                 session_id?: string;
                 notebook_id?: string;
                 notebook_url?: string;
@@ -385,6 +412,46 @@ class NotebookLMMCPServer {
             result = await this.toolHandlers.handleDownloadAudio(
               args as {
                 destination_dir: string;
+                session_id?: string;
+                notebook_id?: string;
+                notebook_url?: string;
+                show_browser?: boolean;
+              }
+            );
+            break;
+
+          case "generate_studio_artifact":
+            result = await this.toolHandlers.handleGenerateStudioArtifact(
+              args as {
+                artifact_type: StudioArtifactType;
+                custom_prompt?: string;
+                wait_for_completion?: boolean;
+                timeout_ms?: number;
+                session_id?: string;
+                notebook_id?: string;
+                notebook_url?: string;
+                show_browser?: boolean;
+              }
+            );
+            break;
+
+          case "get_studio_status":
+            result = await this.toolHandlers.handleGetStudioStatus(
+              (args ?? {}) as {
+                session_id?: string;
+                notebook_id?: string;
+                notebook_url?: string;
+                show_browser?: boolean;
+              }
+            );
+            break;
+
+          case "export_studio_artifact":
+            result = await this.toolHandlers.handleExportStudioArtifact(
+              args as {
+                destination_dir: string;
+                artifact_index?: number;
+                title_filter?: string;
                 session_id?: string;
                 notebook_id?: string;
                 notebook_url?: string;
@@ -412,7 +479,6 @@ class NotebookLMMCPServer {
             };
         }
 
-        // Return result
         return {
           content: [
             {
@@ -445,6 +511,21 @@ class NotebookLMMCPServer {
   }
 
   /**
+   * Programmatic shutdown (closes browser sessions, HTTP listener, and all MCP protocol instances).
+   */
+  public async stop(): Promise<void> {
+    await this.toolHandlers.cleanup();
+    if (this.httpHandle) {
+      await this.httpHandle.close().catch(() => undefined);
+      this.httpHandle = null;
+    }
+    for (const srv of Array.from(this.protocolServers)) {
+      await srv.close().catch(() => undefined);
+      this.protocolServers.delete(srv);
+    }
+  }
+
+  /**
    * Setup graceful shutdown handlers
    */
   private setupShutdownHandlers(): void {
@@ -458,9 +539,6 @@ class NotebookLMMCPServer {
 
       log.info(`\n🛑 Received ${signal}, shutting down gracefully...`);
 
-      // Hard ceiling on cleanup so a wedged browser context can't keep the
-      // process alive (issue #29 — orphan Chrome on macOS after MCP reconnects).
-      // After 5 s we give up gracefully and let `process.exit` reap children.
       const watchdog = setTimeout(() => {
         log.error("⏱️  Shutdown stalled — forcing exit (issue #29 watchdog)");
         process.exit(1);
@@ -468,8 +546,7 @@ class NotebookLMMCPServer {
       watchdog.unref();
 
       try {
-        await this.toolHandlers.cleanup();
-        await this.server.close();
+        await this.stop();
         log.success("✅ Shutdown complete");
         clearTimeout(watchdog);
         process.exit(0);
@@ -503,13 +580,14 @@ class NotebookLMMCPServer {
   /**
    * Start the MCP server using stdio (default) or HTTP transport (issue #4).
    */
-  async start(options: TransportOptions = { kind: "stdio" }): Promise<void> {
+  async start(options: TransportOptions = { kind: "stdio" }): Promise<HttpTransportHandle | null> {
     log.info("🎯 Starting NotebookLM MCP Server...");
     log.info("");
     log.info("📝 Configuration:");
     log.info(`  Config Dir: ${CONFIG.configDir}`);
     log.info(`  Data Dir: ${CONFIG.dataDir}`);
     log.info(`  Headless: ${CONFIG.headless}`);
+    log.info(`  Locale / TZ: ${CONFIG.locale} / ${CONFIG.timezoneId}`);
     log.info(`  Max Sessions: ${CONFIG.maxSessions}`);
     log.info(`  Session Timeout: ${CONFIG.sessionTimeout}s`);
     log.info(`  Stealth: ${CONFIG.stealthEnabled}`);
@@ -517,36 +595,44 @@ class NotebookLMMCPServer {
     log.info("");
 
     if (options.kind === "http") {
-      await startHttpTransport({
+      this.httpHandle = await startHttpTransport({
         port: options.port,
         host: options.host,
         connect: async (transport) => {
-          await this.server.connect(transport);
+          const protocolServer = this.createProtocolServer();
+          const prevClose = transport.onclose;
+          transport.onclose = () => {
+            prevClose?.();
+            this.protocolServers.delete(protocolServer);
+          };
+          await protocolServer.connect(transport);
         },
       });
-      log.success("✅ MCP Server connected via Streamable HTTP");
+      log.success("✅ MCP Server connected via Streamable HTTP (multi-session enabled)");
     } else {
       const transport = new StdioServerTransport();
-      await this.server.connect(transport);
+      const protocolServer = this.createProtocolServer();
+      await protocolServer.connect(transport);
       log.success("✅ MCP Server connected via stdio");
     }
 
-    log.success("🎉 Ready to receive requests from Claude Code!");
+    const activeTools = this.getFilteredTools();
+    log.success(`🎉 Ready to receive MCP requests (${activeTools.length} tools)!`);
     log.info("");
     log.info("💡 Available tools:");
-    for (const tool of this.toolDefinitions) {
+    for (const tool of activeTools) {
       const desc = tool.description ? tool.description.split("\n")[0] : "No description";
       log.info(`  - ${tool.name}: ${desc.substring(0, 80)}...`);
     }
     log.info("");
-    log.info("📖 For documentation, see: README.md");
-    log.info("");
+
+    return this.httpHandle;
   }
 }
 
-type TransportOptions = { kind: "stdio" } | { kind: "http"; port: number; host?: string };
+export type TransportOptions = { kind: "stdio" } | { kind: "http"; port: number; host?: string };
 
-function parseTransportOptions(argv: readonly string[]): TransportOptions {
+export function parseTransportOptions(argv: readonly string[]): TransportOptions {
   let kind: "stdio" | "http" = "stdio";
   let port = 3000;
   let host: string | undefined;
@@ -583,7 +669,6 @@ function parseTransportOptions(argv: readonly string[]): TransportOptions {
     }
   }
 
-  // Env-var fallbacks for hosted deployments.
   const envTransport = process.env.NOTEBOOKLM_TRANSPORT;
   if (envTransport === "http" || envTransport === "stdio") kind = envTransport;
   const envPort = process.env.NOTEBOOKLM_PORT;
@@ -598,21 +683,63 @@ function parseTransportOptions(argv: readonly string[]): TransportOptions {
   return { kind: "stdio" };
 }
 
+function isDirectExecution(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return path.resolve(entry) === path.resolve(fileURLToPath(import.meta.url));
+  }
+}
+
 /**
  * Main entry point
  */
 async function main() {
-  // Handle CLI commands
   const args = process.argv.slice(2);
+  if (args.length > 0 && args[0] === "auth") {
+    const authManager = new AuthManager();
+    console.error("🌐 Opening browser for interactive Google login...");
+    const ok = await authManager.performSetup(async (msg) => {
+      console.error(`[AUTH] ${msg}`);
+    }, true);
+    if (ok) {
+      console.error("✅ Authenticated successfully! Saved to persistent profile.");
+      process.exit(0);
+    } else {
+      console.error("❌ Authentication failed or cancelled.");
+      process.exit(1);
+    }
+  }
+
+  if (
+    args.length > 0 &&
+    (args[0] === "auth:cookies" || args[0] === "token" || args[0] === "auth:token")
+  ) {
+    const rawCookies = args.slice(1).join(" ");
+    if (!rawCookies) {
+      console.error('❌ Please provide cookie string or JSON: npm run auth:cookies "<cookies>"');
+      process.exit(1);
+    }
+    const authManager = new AuthManager();
+    const res = await authManager.importCookies(rawCookies);
+    if (res.success) {
+      console.error(`✅ Successfully imported ${res.importedCount} cookies!`);
+      console.error(`🔑 Critical cookies: ${res.criticalFound.join(", ") || "none"}`);
+      process.exit(0);
+    } else {
+      console.error(`❌ Failed to import cookies: ${res.error || res.message}`);
+      process.exit(1);
+    }
+  }
+
   if (args.length > 0 && args[0] === "config") {
     const cli = new CliHandler();
     await cli.handleCommand(args);
     process.exit(0);
   }
 
-  // Apply --account / NOTEBOOKLM_ACCOUNT before any directory or browser is
-  // touched (issue #2). The account-switcher rewrites CONFIG paths so each
-  // Google account gets an isolated Chrome profile + auth state directory.
   const account = getRequestedAccount();
   if (account) {
     applyAccountToConfig(CONFIG, account);
@@ -620,12 +747,11 @@ async function main() {
     log.info(`👤 Account profile active: ${account}`);
   }
 
-  // Print banner
   console.error("╔══════════════════════════════════════════════════════════╗");
   console.error("║                                                          ║");
-  console.error("║           NotebookLM MCP Server v2.0.0                   ║");
+  console.error("║           NotebookLM MCP Server v2.1.0                   ║");
   console.error("║                                                          ║");
-  console.error("║   Chat with Gemini 2.5 through NotebookLM via MCP       ║");
+  console.error("║   Research & Studio Automation with Google NotebookLM    ║");
   console.error("║                                                          ║");
   console.error("╚══════════════════════════════════════════════════════════╝");
   console.error("");
@@ -643,5 +769,6 @@ async function main() {
   }
 }
 
-// Run the server
-main();
+if (isDirectExecution()) {
+  void main();
+}

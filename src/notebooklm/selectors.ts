@@ -1,5 +1,5 @@
 /**
- * Central selector registry for the NotebookLM web UI.
+ * Central selector registry for the NotebookLM web UI (2026 layout).
  *
  * # Multilingual strategy
  *
@@ -10,21 +10,15 @@
  *      are Angular component selectors and identical in every locale.
  *
  *   2. **Material-Symbols icon names** (`audio_magic_eraser`, `content_paste`,
- *      `link`, `upload`, `download`, …) — Google ships them as the literal
- *      text node of `<mat-icon>` in every locale, so they are 100% language-
- *      agnostic. Most stable anchor for icon-driven controls.
+ *      `link`, `upload`, `download`, `movie`, `account_tree`, `slideshow`, …) —
+ *      Google ships them as the literal text node of `<mat-icon>` in every
+ *      locale, so they are 100% language-agnostic.
  *
  *   3. **`role="dialog"`, `role="button"`** — set synchronously by Angular,
  *      no animation race.
  *
- *   4. **Locale-bound aria-labels and visible text** — last resort. Each
- *      list below covers the eight major NotebookLM locales:
- *      EN, DE, FR, ES, PT, IT, NL, JA. Adding more is mechanical; nothing
- *      breaks if a locale is missing because the class/icon anchors fire
- *      first.
- *
- * Last verified: 2026-05 against the live notebooklm.google.com layout
- * (DE, EN locales).
+ *   4. **Locale-bound aria-labels and visible text** — last resort covering
+ *      EN, DE, FR, ES, PT, IT, NL, JA.
  */
 
 export const Selectors = {
@@ -32,15 +26,13 @@ export const Selectors = {
     answerContainer: ".to-user-container",
     answerText: ".to-user-container .message-text-content",
     latestAnswerText: ".to-user-container:last-child .message-text-content",
-    /**
-     * Chat textarea. The class is shared across locales; aria-labels are a
-     * fallback for older builds where the class was different.
-     */
     queryInput: [
       "textarea.query-box-input",
       'textarea[aria-label*="query" i]',
+      'textarea[aria-label*="start typing" i]',
       'textarea[aria-label*="anfrag" i]',
       'textarea[aria-label*="requete" i]',
+      'textarea[aria-label*="requête" i]',
       'textarea[aria-label*="zone de requete" i]',
       'textarea[aria-label*="consulta" i]',
       'textarea[aria-label*="domanda" i]',
@@ -48,13 +40,6 @@ export const Selectors = {
       'textarea[aria-label*="質問" i]',
       'textarea[aria-label*="pergunta" i]',
     ],
-    /**
-     * The chat submit button has the *language-bound* aria-label
-     * (Send / Senden / Envoyer / Enviar / Invia / Verzenden / 送信). It also
-     * has the stable class `.submit-button`. The sources web-search overlay
-     * uses `.actions-enter-button` with the SAME aria-label, so we MUST
-     * anchor on `.submit-button` to avoid distractor matches.
-     */
     submitButton: [
       "button.submit-button",
       'button.submit-button[aria-label*="send" i]',
@@ -67,12 +52,9 @@ export const Selectors = {
     ],
   },
 
-  /**
-   * NotebookLM removed tabs in favour of a three-pane sidebar (2026 layout).
-   * These selectors are kept only for the rare legacy layouts.
-   */
   tabs: {
     discussion: [
+      '[role="tab"]:has-text("Chat")',
       '[role="tab"]:has-text("Discussion")',
       '[role="tab"]:has-text("Diskussion")',
       '[role="tab"]:has-text("Diskussionen")',
@@ -107,24 +89,18 @@ export const Selectors = {
   },
 
   sources: {
-    /**
-     * Per-source row in the sidebar (language-agnostic). Stable Angular
-     * class — verified across all observed locales.
-     */
     sourceContainer: ".single-source-container",
-    /**
-     * "X Quellen" / "X sources" header text. Numeric so we read the count
-     * via regex on the visible text. Independent of sidebar collapse state.
-     */
+    sourceTitle: [
+      ".single-source-container .source-title",
+      ".single-source-container .title",
+      ".single-source-container span.mat-mdc-tooltip-trigger",
+    ],
     sourceCountIndicator: ".cover-subtitle-source-count",
-    /**
-     * Sidebar "Add source" button. Class `.add-source-button` is language-
-     * agnostic; aria-labels listed for older builds without the class.
-     */
     addButton: [
       "button.add-source-button",
       'button[aria-label="Add source"]',
       'button[aria-label*="add source" i]',
+      'button[aria-label*="add sources" i]',
       'button[aria-label*="quelle hinzu" i]',
       'button[aria-label*="ajouter une source" i]',
       'button[aria-label*="añadir fuente" i]',
@@ -134,80 +110,78 @@ export const Selectors = {
       'button[aria-label*="bron toevoegen" i]',
       'button[aria-label*="ソースを追加" i]',
     ],
-    /**
-     * Real Material modal. `[role="dialog"]` is set by Angular synchronously
-     * the moment the modal mounts — race-free against the `.mdc-dialog--open`
-     * animation class and resistant to Material-UI version bumps. Avoid
-     * `.cdk-overlay-pane` (matches every dropdown / emoji picker / menu).
-     */
     overlayPane: '[role="dialog"]',
-    overlayInput: '[role="dialog"] input[type="text"]:not([readonly])',
+    overlayInput:
+      '[role="dialog"] input[type="url"]:not([readonly]), [role="dialog"] input[type="text"]:not([readonly])',
     overlayTextarea: '[role="dialog"] textarea',
-    /**
-     * Source-type buttons in the Add-source overlay. Google ships them
-     * *without* aria-labels — the only stable, language-agnostic anchor is
-     * the Material-Symbols icon name baked into a `<mat-icon>` text node.
-     */
     sourceTypeUrl: [
-      // Icon-anchored (language-free) — primary path.
-      "button.drop-zone-icon-button:has(mat-icon.youtube-icon)",
+      // Icon-anchored (language-free) — website/link icons first!
+      'button.drop-zone-icon-button:has(mat-icon:text-is("web"))',
       'button.drop-zone-icon-button:has(mat-icon:text-is("link"))',
-      // Visible-text fallbacks for the eight major locales.
-      'button.drop-zone-icon-button:has-text("Websites")',
+      'button.drop-zone-icon-button:has(mat-icon:text-is("language"))',
+      'mat-chip-option:has(mat-icon:text-is("web"))',
+      'mat-chip-option:has(mat-icon:text-is("link"))',
+      // Visible-text fallbacks for major locales.
       'button.drop-zone-icon-button:has-text("Website")',
+      'button.drop-zone-icon-button:has-text("Websites")',
       'button.drop-zone-icon-button:has-text("Sites Web")',
       'button.drop-zone-icon-button:has-text("Sitio web")',
       'button.drop-zone-icon-button:has-text("Sito web")',
       'button.drop-zone-icon-button:has-text("Sites")',
       'button.drop-zone-icon-button:has-text("ウェブサイト")',
-      'span:has-text("Website")',
-      'span:has-text("URL")',
+      '[role="dialog"] button:has-text("Website")',
+      '[role="dialog"] span:has-text("Website")',
+      '[role="dialog"] span:has-text("URL")',
+    ],
+    sourceTypeYoutube: [
+      "button.drop-zone-icon-button:has(mat-icon.youtube-icon)",
+      'button.drop-zone-icon-button:has(mat-icon:text-is("video_youtube"))',
+      'button.drop-zone-icon-button:has(mat-icon:text-is("smart_display"))',
+      'button.drop-zone-icon-button:has(mat-icon:text-is("youtube_activity"))',
+      'mat-chip-option:has-text("YouTube")',
+      'button.drop-zone-icon-button:has-text("YouTube")',
+      '[role="dialog"] button:has-text("YouTube")',
+      '[role="dialog"] span:has-text("YouTube")',
     ],
     sourceTypeText: [
-      // Icon-anchored (language-free) — primary path.
       'button.drop-zone-icon-button:has(mat-icon:text-is("content_paste"))',
-      // Visible-text fallbacks for major locales.
-      'button.drop-zone-icon-button:has-text("Kopierter Text")',
+      'mat-chip-option:has(mat-icon:text-is("content_paste"))',
       'button.drop-zone-icon-button:has-text("Copied text")',
       'button.drop-zone-icon-button:has-text("Pasted text")',
+      'button.drop-zone-icon-button:has-text("Kopierter Text")',
       'button.drop-zone-icon-button:has-text("Texte copié")',
       'button.drop-zone-icon-button:has-text("Texto copiado")',
       'button.drop-zone-icon-button:has-text("Testo copiato")',
       'button.drop-zone-icon-button:has-text("Gekopieerde tekst")',
       'button.drop-zone-icon-button:has-text("コピーしたテキスト")',
-      'span:has-text("Copied text")',
-      'span:has-text("Pasted text")',
+      '[role="dialog"] button:has-text("Copied text")',
+      '[role="dialog"] span:has-text("Copied text")',
+      '[role="dialog"] span:has-text("Pasted text")',
       '[data-type="text"]',
     ],
-    sourceTypeYoutube: [
-      "button.drop-zone-icon-button mat-icon.youtube-icon",
-      'button.drop-zone-icon-button:has(mat-icon:text-is("video_youtube"))',
-    ],
     sourceTypeFile: [
-      'input[type="file"]',
       'button.drop-zone-icon-button:has(mat-icon:text-is("upload"))',
-      'button.drop-zone-icon-button:has-text("Dateien hochladen")',
+      'button:has(mat-icon:text-is("upload_file"))',
+      'button:has(mat-icon:text-is("upload"))',
       'button.drop-zone-icon-button:has-text("Upload sources")',
+      'button.drop-zone-icon-button:has-text("Choose file")',
+      'button.drop-zone-icon-button:has-text("Dateien hochladen")',
       'button.drop-zone-icon-button:has-text("Importer")',
       'button.drop-zone-icon-button:has-text("Subir")',
       'button.drop-zone-icon-button:has-text("Carica")',
       'button.drop-zone-icon-button:has-text("Uploaden")',
       'button.drop-zone-icon-button:has-text("アップロード")',
+      '[role="dialog"] button:has-text("choose file")',
     ],
-    /**
-     * Primary submit button in the add-source dialog. Material's
-     * `.mdc-button--raised` class is the most stable anchor; per-locale
-     * visible-text variants are fallbacks for older builds.
-     */
+    fileInput: '[role="dialog"] input[type="file"], input[type="file"]',
     insertConfirm: [
-      // Class-anchored (language-free).
       'button.mdc-button--raised:has-text("Insert")',
       'button.mat-flat-button:has-text("Insert")',
       'button[color="primary"]:has-text("Insert")',
-      // Visible-text fallbacks for major locales.
       'button.mdc-button--raised:has-text("Einfügen")',
       'button.mdc-button--raised:has-text("Hinzufügen")',
       'button.mdc-button--raised:has-text("Ajouter")',
+      'button.mdc-button--raised:has-text("Insérer")',
       'button.mdc-button--raised:has-text("Insertar")',
       'button.mdc-button--raised:has-text("Inserisci")',
       'button.mdc-button--raised:has-text("Invoegen")',
@@ -236,35 +210,148 @@ export const Selectors = {
   },
 
   studio: {
-    /**
-     * "Audio Overview" entry control. As of the 2026-05 Studio layout this
-     * is a `<div role="button">` with a Material-Symbols `audio_magic_eraser`
-     * icon, NOT a real `<button>`. Icon-anchored selectors fire first.
-     */
+    panel: ".studio-panel, studio-panel",
+    expandButton: [
+      'button:has(mat-icon:text-is("dock_to_left"))',
+      'button[aria-label*="expand" i][aria-label*="studio" i]',
+      'button[aria-label*="erweitern" i][aria-label*="studio" i]',
+      'button[aria-label*="ouvrir" i][aria-label*="studio" i]',
+      'button[aria-label*="abrir" i][aria-label*="studio" i]',
+      'button[aria-label*="aprire" i][aria-label*="studio" i]',
+    ],
     audioOverviewButton: [
-      // Icon-anchored (language-free) — primary path.
       '.create-artifact-button-container:has(mat-icon:text-is("audio_magic_eraser"))',
       '[role="button"]:has(mat-icon:text-is("audio_magic_eraser"))',
-      // Locale-bound aria-labels for the eight major locales.
-      '[role="button"][aria-label*="audio-zusammenfassung" i]',
+      '[role="button"]:has(mat-icon:text-is("podcasts"))',
       '[role="button"][aria-label*="audio overview" i]',
+      '[role="button"][aria-label*="audio-zusammenfassung" i]',
       '[role="button"][aria-label*="aperçu audio" i]',
       '[role="button"][aria-label*="resumen de audio" i]',
       '[role="button"][aria-label*="panoramica audio" i]',
       '[role="button"][aria-label*="visão geral de áudio" i]',
       '[role="button"][aria-label*="audio-overzicht" i]',
       '[role="button"][aria-label*="音声の概要" i]',
-      '[role="button"][aria-label*="audio" i]',
-      // Legacy <button> fallbacks for older builds.
       'button:has(mat-icon:text-is("audio_magic_eraser"))',
       'button[aria-label*="audio overview" i]',
       'button[aria-label*="audio-zusammenfassung" i]',
       'button[aria-label*="podcast" i]',
     ],
-    /**
-     * Generate / Generieren / Générer trigger inside the customise dialog.
-     * Visible-text varies by locale.
-     */
+    videoOverviewButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("movie"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("video_spark"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("videocam"))',
+      '[role="button"]:has(mat-icon:text-is("movie"))',
+      '[role="button"]:has(mat-icon:text-is("video_spark"))',
+      '[role="button"][aria-label*="video overview" i]',
+      '[role="button"][aria-label*="video-zusammenfassung" i]',
+      '[role="button"][aria-label*="aperçu vidéo" i]',
+      '[role="button"][aria-label*="resumen de video" i]',
+      '[role="button"][aria-label*="panoramica video" i]',
+      '[role="button"][aria-label*="動画の概要" i]',
+      'button:has(mat-icon:text-is("movie"))',
+      'button:has-text("Video Overview")',
+    ],
+    mindMapButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("account_tree"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("hub"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("mediation"))',
+      '[role="button"]:has(mat-icon:text-is("account_tree"))',
+      '[role="button"]:has(mat-icon:text-is("hub"))',
+      '[role="button"][aria-label*="mind map" i]',
+      '[role="button"][aria-label*="mindmap" i]',
+      '[role="button"][aria-label*="carte mentale" i]',
+      '[role="button"][aria-label*="mapa mental" i]',
+      '[role="button"][aria-label*="mappa mentale" i]',
+      '[role="button"][aria-label*="マインドマップ" i]',
+      'button:has-text("Mind Map")',
+      'button:has-text("Mindmap")',
+    ],
+    slideDeckButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("slideshow"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("co_present"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("present_to_all"))',
+      '[role="button"]:has(mat-icon:text-is("slideshow"))',
+      '[role="button"]:has(mat-icon:text-is("co_present"))',
+      '[role="button"][aria-label*="slide" i]',
+      '[role="button"][aria-label*="presentation" i]',
+      '[role="button"][aria-label*="präsentation" i]',
+      '[role="button"][aria-label*="présentation" i]',
+      '[role="button"][aria-label*="presentación" i]',
+      '[role="button"][aria-label*="スライド" i]',
+      'button:has-text("Slide Deck")',
+      'button:has-text("Presentation")',
+    ],
+    infographicButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("insert_chart"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("analytics"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("auto_awesome_mosaic"))',
+      '[role="button"]:has(mat-icon:text-is("insert_chart"))',
+      '[role="button"][aria-label*="infographic" i]',
+      '[role="button"][aria-label*="infografik" i]',
+      '[role="button"][aria-label*="infographie" i]',
+      '[role="button"][aria-label*="infografía" i]',
+      '[role="button"][aria-label*="インフォグラフィック" i]',
+      'button:has-text("Infographic")',
+    ],
+    flashcardsButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("style"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("playing_cards"))',
+      '[role="button"]:has(mat-icon:text-is("style"))',
+      '[role="button"][aria-label*="flashcard" i]',
+      '[role="button"][aria-label*="karteikarten" i]',
+      '[role="button"][aria-label*="fiches" i]',
+      '[role="button"][aria-label*="tarjetas" i]',
+      '[role="button"][aria-label*="フラッシュカード" i]',
+      'button:has-text("Flashcards")',
+    ],
+    quizButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("quiz"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("fact_check"))',
+      '[role="button"]:has(mat-icon:text-is("quiz"))',
+      '[role="button"][aria-label*="quiz" i]',
+      '[role="button"][aria-label*="cuestionario" i]',
+      '[role="button"][aria-label*="クイズ" i]',
+      'button:has-text("Quiz")',
+    ],
+    reportsButton: [
+      '.create-artifact-button-container:has(mat-icon:text-is("description"))',
+      '.create-artifact-button-container:has(mat-icon:text-is("article"))',
+      '[role="button"]:has(mat-icon:text-is("description"))',
+      '[role="button"][aria-label*="report" i]',
+      '[role="button"][aria-label*="bericht" i]',
+      '[role="button"][aria-label*="rapport" i]',
+      '[role="button"][aria-label*="informe" i]',
+      '[role="button"][aria-label*="レポート" i]',
+      'button:has-text("Reports")',
+    ],
+    briefingDocButton: [
+      'button:has-text("Briefing doc")',
+      'button:has-text("Briefing Doc")',
+      '[role="button"]:has-text("Briefing doc")',
+      'button:has-text("Briefing-Dokument")',
+      'button:has-text("Note de synthèse")',
+      'button:has-text("Documento de resumen")',
+    ],
+    studyGuideButton: [
+      'button:has-text("Study guide")',
+      'button:has-text("Study Guide")',
+      '[role="button"]:has-text("Study guide")',
+      'button:has-text("Studienleitfaden")',
+      'button:has-text("Guide d\'étude")',
+      'button:has-text("Guía de estudio")',
+    ],
+    faqButton: [
+      'button:has-text("FAQ")',
+      '[role="button"]:has-text("FAQ")',
+      'button:has-text("Preguntas frecuentes")',
+    ],
+    timelineButton: [
+      'button:has-text("Timeline")',
+      '[role="button"]:has-text("Timeline")',
+      'button:has-text("Zeitleiste")',
+      'button:has-text("Chronologie")',
+      'button:has-text("Cronología")',
+    ],
     generateButton: [
       'button:has-text("Generate")',
       'button:has-text("Generieren")',
@@ -276,14 +363,8 @@ export const Selectors = {
       'button:has-text("Genereren")',
       'button:has-text("生成")',
     ],
-    /**
-     * Download trigger. The Studio panel uses an icon-only button with a
-     * `download` Material-Symbols glyph; aria-label is locale-bound.
-     */
     downloadButton: [
-      // Icon-anchored (language-free) — primary path.
       'button:has(mat-icon:text-is("download"))',
-      // Locale-bound aria-labels.
       'button[aria-label*="download" i]',
       'button[aria-label*="herunterladen" i]',
       'button[aria-label*="télécharger" i]',
@@ -293,27 +374,15 @@ export const Selectors = {
       'button[aria-label*="downloaden" i]',
       'button[aria-label*="ダウンロード" i]',
     ],
-    /**
-     * Completed Audio-Overview tile. Modern NotebookLM does NOT mount a real
-     * `<audio>` element in the DOM; the player is a custom Angular tile
-     * inside `.artifact-library-container > artifact-library-item`. The
-     * play-button (`button.artifact-action-button` with locale-bound
-     * aria-label "Wiedergeben"/"Play"/…) is the most reliable "audio is
-     * ready" signal because it only mounts after generation completes.
-     */
+    artifactItem: "artifact-library-item, .artifact-library-container artifact-library-item",
     audioPlayer: [
       "artifact-library-item:has(button.artifact-action-button)",
       ".artifact-library-container artifact-library-item",
-      // Legacy <audio> tag for older builds.
       "audio",
       '[role="audio"]',
     ],
-    /**
-     * Per-tile "Mehr"/"More"/"Plus"/… three-dot button. Opens the menu that
-     * contains the Download item.
-     */
     audioMoreMenuButton: [
-      "artifact-library-item button:has(mat-icon:text-is(\"more_vert\"))",
+      'artifact-library-item button:has(mat-icon:text-is("more_vert"))',
       'artifact-library-item button[aria-label*="mehr" i]',
       'artifact-library-item button[aria-label*="more" i]',
       'artifact-library-item button[aria-label*="plus" i]',
@@ -323,9 +392,6 @@ export const Selectors = {
       'artifact-library-item button[aria-label*="meer" i]',
       'artifact-library-item button[aria-label*="その他" i]',
     ],
-    /**
-     * Download menu-item that surfaces after clicking the three-dot menu.
-     */
     audioDownloadMenuItem: [
       '[role="menuitem"]:has(mat-icon:text-is("download"))',
       '[role="menuitem"]:has-text("Download")',
@@ -340,7 +406,35 @@ export const Selectors = {
   },
 
   notebooks: {
-    projectCard: 'button[aria-labelledby*="project-"]',
+    createButton: [
+      "button.create-new-button",
+      ".create-new-action-button",
+      'button[aria-label*="create new" i]',
+      'button[aria-label*="new notebook" i]',
+      'button[aria-label*="neues" i]',
+      'button[aria-label*="créer" i]',
+      'button[aria-label*="nouveau" i]',
+      'button[aria-label*="crear" i]',
+      'button[aria-label*="nuovo" i]',
+      'button:has(mat-icon:text-is("add")):has-text("Create")',
+      'button:has(mat-icon:text-is("add")):has-text("New")',
+      "mat-card.create-new-action-button",
+      '[role="button"]:has-text("Create new")',
+      '[role="button"]:has-text("New notebook")',
+      'button:has-text("Create new")',
+      'button:has-text("New notebook")',
+    ],
+    titleInput: [
+      "input.title-input",
+      "textarea.title-input",
+      ".notebook-title input",
+      'input[aria-label*="notebook title" i]',
+      'input[aria-label*="titel" i]',
+      'input[aria-label*="titre" i]',
+      'input[aria-label*="título" i]',
+    ],
+    projectCard:
+      'project-button, mat-card.project-button-card, button[aria-labelledby*="project-"], a[href*="/notebook/"]',
     cardMenuButton: [
       'button[aria-label*="menu" i]',
       'button[aria-label*="options" i]',
@@ -375,10 +469,6 @@ export const Selectors = {
     ],
   },
 
-  /**
-   * Material Icon labels that leak into extracted answer text as isolated
-   * lines. Stripped from the response before delivery to the client.
-   */
   uiControlLabels: new Set([
     "more_horiz",
     "more_vert",
@@ -397,12 +487,6 @@ export const Selectors = {
   ]),
 } as const;
 
-/**
- * Joins a list of selector candidates into a comma-separated string.
- * Patchright/Playwright accepts this as a CSS locator (comma = OR).
- *
- * Example: `joinAlt(Selectors.chat.queryInput)` → `"textarea.query-box-input, textarea[aria-label*=\"query\" i], ..."`
- */
 export function joinAlt(selectors: readonly string[]): string {
   return selectors.join(", ");
 }
